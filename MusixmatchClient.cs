@@ -14,12 +14,30 @@ public class SyncedLyricLine
     public string? Performer { get; set; }
 }
 
+public class KaraokeWord
+{
+    public string Word { get; set; } = "";
+    public int OffsetMs { get; set; }
+    public int DurationMs { get; set; }
+}
+
+public class KaraokeLine
+{
+    public int StartTimeMs { get; set; }
+    public int EndTimeMs { get; set; }
+    public string? Performer { get; set; }
+    public List<KaraokeWord> Words { get; set; } = new();
+
+    public string FullText => string.Concat(Words.Select(w => w.Word));
+}
+
 public class MusixmatchClient
 {
     private const string BaseUrl = "https://apic-appmobile.musixmatch.com/ws/1.1/";
     private readonly HttpClient _http = new();
 
     public string UserToken { get; private set; } = "";
+    public List<KaraokeLine> LastKaraokeLines { get; private set; } = new();
 
     public MusixmatchClient()
     {
@@ -76,6 +94,7 @@ public class MusixmatchClient
     {
         AppLogger.Log($"GetSyncedLyricsAsync begin | artist={artist} | title={title} | album={album} | spotifyUri={spotifyUri} | durationMs={durationMs}");
 
+        LastKaraokeLines = new List<KaraokeLine>();
         await EnsureTokenAsync();
 
         using var macroDoc = await GetMacroSubtitlesAsync(artist, title, album, spotifyUri, durationMs);
@@ -93,7 +112,7 @@ public class MusixmatchClient
         }
 
         var trackBody = matcherTrackGet.GetProperty("message").GetProperty("body");
-        if (!trackBody.TryGetProperty("track", out var track))
+        if (!trackBody.TryGetProperty("track", out var track) || track.ValueKind != JsonValueKind.Object)
         {
             AppLogger.Log("No track object in matcher.track.get body");
             return new List<SyncedLyricLine>();
@@ -102,11 +121,13 @@ public class MusixmatchClient
         bool instrumental = TryGetBool(track, "instrumental");
         bool hasRichSync = TryGetBool(track, "has_richsync");
         bool hasSubtitles = TryGetBool(track, "has_subtitles");
+        bool hasLyrics = TryGetBool(track, "has_lyrics");
+        bool hasLyricsCrowd = TryGetBool(track, "has_lyrics_crowd");
 
         string commonTrackId = track.TryGetProperty("commontrack_id", out var ctid) ? ctid.ToString() : "";
         string trackLength = track.TryGetProperty("track_length", out var tlen) ? tlen.ToString() : "";
 
-        AppLogger.Log($"Track flags | instrumental={instrumental} | hasRichSync={hasRichSync} | hasSubtitles={hasSubtitles} | commontrack_id={commonTrackId} | track_length={trackLength}");
+        AppLogger.Log($"Track flags | instrumental={instrumental} | hasRichSync={hasRichSync} | hasSubtitles={hasSubtitles} | hasLyrics={hasLyrics} | hasLyricsCrowd={hasLyricsCrowd} | commontrack_id={commonTrackId} | track_length={trackLength}");
 
         if (instrumental)
         {
@@ -121,7 +142,7 @@ public class MusixmatchClient
         {
             AppLogger.Log("Attempting richsync fetch");
             var rich = await GetKaraokeAsync(track);
-            AppLogger.Log($"Richsync returned {rich.Count} lines");
+            AppLogger.Log($"Richsync returned {rich.Count} lines, karaokeCount={LastKaraokeLines.Count}");
             if (rich.Count > 0)
                 return rich;
         }
@@ -135,7 +156,16 @@ public class MusixmatchClient
                 return synced;
         }
 
-        AppLogger.Log("No richsync or subtitles found, returning empty list");
+        if (hasLyrics || hasLyricsCrowd)
+        {
+            AppLogger.Log("Attempting unsynced lyric parse from macro");
+            var unsynced = GetUnsyncedFromMacro(macroCalls);
+            AppLogger.Log($"Unsynced parse returned {unsynced.Count} lines");
+            if (unsynced.Count > 0)
+                return unsynced;
+        }
+
+        AppLogger.Log("No richsync, subtitles, or unsynced lyrics found, returning empty list");
         return new List<SyncedLyricLine>();
     }
 
@@ -174,6 +204,7 @@ public class MusixmatchClient
     private async Task<List<SyncedLyricLine>> GetKaraokeAsync(JsonElement track)
     {
         var result = new List<SyncedLyricLine>();
+        LastKaraokeLines = new List<KaraokeLine>();
 
         if (!track.TryGetProperty("commontrack_id", out var commonTrackIdEl))
         {
@@ -211,13 +242,13 @@ public class MusixmatchClient
             return result;
 
         var body = message.GetProperty("body");
-        if (!body.TryGetProperty("richsync", out var richsync))
+        if (!body.TryGetProperty("richsync", out var richsync) || richsync.ValueKind != JsonValueKind.Object)
         {
             AppLogger.Log("Richsync body missing richsync object");
             return result;
         }
 
-        if (!richsync.TryGetProperty("richsync_body", out var richsyncBodyEl))
+        if (!richsync.TryGetProperty("richsync_body", out var richsyncBodyEl) || richsyncBodyEl.ValueKind != JsonValueKind.String)
         {
             AppLogger.Log("Richsync object missing richsync_body");
             return result;
@@ -231,15 +262,190 @@ public class MusixmatchClient
 
         using var richDoc = JsonDocument.Parse(richsyncBody);
 
+        if (richDoc.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            AppLogger.Log($"Richsync root is {richDoc.RootElement.ValueKind}, expected Array");
+            return result;
+        }
+
         foreach (var line in richDoc.RootElement.EnumerateArray())
         {
-            double ts = line.GetProperty("ts").GetDouble();
-            int startMs = (int)(ts * 1000);
+            if (line.ValueKind != JsonValueKind.Object)
+                continue;
 
-            string text = "";
-            if (line.TryGetProperty("l", out var words) && words.ValueKind == JsonValueKind.Array)
+            double ts = line.TryGetProperty("ts", out var tsEl) && tsEl.ValueKind == JsonValueKind.Number
+                ? tsEl.GetDouble()
+                : 0;
+
+            double te = line.TryGetProperty("te", out var teEl) && teEl.ValueKind == JsonValueKind.Number
+                ? teEl.GetDouble()
+                : ts;
+
+            int startTimeMs = (int)Math.Round(ts * 1000.0);
+            int endTimeMs = (int)Math.Round(te * 1000.0);
+
+            var karaokeLine = new KaraokeLine
             {
-                text = string.Concat(words.EnumerateArray().Select(w => w.GetProperty("c").GetString() ?? ""));
+                StartTimeMs = startTimeMs,
+                EndTimeMs = endTimeMs
+            };
+
+            if (line.TryGetProperty("l", out var wordsEl) && wordsEl.ValueKind == JsonValueKind.Array)
+            {
+                var words = wordsEl.EnumerateArray().ToList();
+
+                for (int i = 0; i < words.Count; i++)
+                {
+                    var wordEl = words[i];
+                    if (wordEl.ValueKind != JsonValueKind.Object)
+                        continue;
+
+                    string wordText =
+                        wordEl.TryGetProperty("c", out var cEl) && cEl.ValueKind == JsonValueKind.String
+                            ? cEl.GetString() ?? ""
+                            : "";
+
+                    double wordOffsetSec =
+                        wordEl.TryGetProperty("o", out var oEl) && oEl.ValueKind == JsonValueKind.Number
+                            ? oEl.GetDouble()
+                            : 0;
+
+                    double? nextWordOffsetSec = null;
+                    if (i + 1 < words.Count)
+                    {
+                        var nextWordEl = words[i + 1];
+                        if (nextWordEl.ValueKind == JsonValueKind.Object &&
+                            nextWordEl.TryGetProperty("o", out var nextOEl) &&
+                            nextOEl.ValueKind == JsonValueKind.Number)
+                        {
+                            nextWordOffsetSec = nextOEl.GetDouble();
+                        }
+                    }
+
+                    int offsetMs = (int)Math.Round(wordOffsetSec * 1000.0);
+
+                    int durationMs;
+                    if (nextWordOffsetSec.HasValue)
+                    {
+                        durationMs = (int)Math.Round((nextWordOffsetSec.Value - wordOffsetSec) * 1000.0);
+                    }
+                    else
+                    {
+                        durationMs = Math.Max(0, endTimeMs - (startTimeMs + offsetMs));
+                    }
+
+                    karaokeLine.Words.Add(new KaraokeWord
+                    {
+                        Word = wordText,
+                        OffsetMs = offsetMs,
+                        DurationMs = Math.Max(0, durationMs)
+                    });
+                }
+            }
+
+            if (karaokeLine.Words.Count > 0)
+            {
+                LastKaraokeLines.Add(karaokeLine);
+
+                result.Add(new SyncedLyricLine
+                {
+                    Text = string.IsNullOrWhiteSpace(karaokeLine.FullText) ? "♪" : karaokeLine.FullText,
+                    StartTimeMs = karaokeLine.StartTimeMs
+                });
+            }
+        }
+
+        AppLogger.Log($"Richsync parsed karaoke line count={LastKaraokeLines.Count}");
+        return result;
+    }
+
+    private List<SyncedLyricLine> GetSyncedFromMacro(JsonElement macroCalls)
+    {
+        var result = new List<SyncedLyricLine>();
+        AppLogger.Log("GetSyncedFromMacro begin");
+
+        if (macroCalls.ValueKind != JsonValueKind.Object)
+        {
+            AppLogger.Log($"GetSyncedFromMacro: macroCalls is {macroCalls.ValueKind}, expected Object");
+            return result;
+        }
+
+        if (!macroCalls.TryGetProperty("track.subtitles.get", out var subtitlesGet) ||
+            subtitlesGet.ValueKind != JsonValueKind.Object)
+        {
+            AppLogger.Log("Macro missing track.subtitles.get");
+            return result;
+        }
+
+        if (!subtitlesGet.TryGetProperty("message", out var message) ||
+            message.ValueKind != JsonValueKind.Object)
+        {
+            AppLogger.Log("track.subtitles.get missing message");
+            return result;
+        }
+
+        if (!message.TryGetProperty("body", out var body) ||
+            body.ValueKind != JsonValueKind.Object)
+        {
+            AppLogger.Log("track.subtitles.get missing body");
+            return result;
+        }
+
+        if (!body.TryGetProperty("subtitle_list", out var subtitleList) ||
+            subtitleList.ValueKind != JsonValueKind.Array ||
+            subtitleList.GetArrayLength() == 0)
+        {
+            AppLogger.Log("track.subtitles.get missing or empty subtitle_list");
+            return result;
+        }
+
+        var first = subtitleList[0];
+        if (first.ValueKind != JsonValueKind.Object ||
+            !first.TryGetProperty("subtitle", out var subtitle) ||
+            subtitle.ValueKind != JsonValueKind.Object)
+        {
+            AppLogger.Log("subtitle_list[0].subtitle missing");
+            return result;
+        }
+
+        if (!subtitle.TryGetProperty("subtitle_body", out var subtitleBodyEl) ||
+            subtitleBodyEl.ValueKind != JsonValueKind.String)
+        {
+            AppLogger.Log("subtitle.subtitle_body missing");
+            return result;
+        }
+
+        string subtitleBody = subtitleBodyEl.GetString() ?? "";
+        AppLogger.Log($"Subtitle body length={subtitleBody.Length}");
+
+        if (string.IsNullOrWhiteSpace(subtitleBody))
+            return result;
+
+        using var subtitleDoc = JsonDocument.Parse(subtitleBody);
+
+        if (subtitleDoc.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            AppLogger.Log($"subtitle_body root is {subtitleDoc.RootElement.ValueKind}, expected Array");
+            return result;
+        }
+
+        foreach (var line in subtitleDoc.RootElement.EnumerateArray())
+        {
+            string text = "♪";
+            int startMs = 0;
+
+            if (line.ValueKind == JsonValueKind.Object)
+            {
+                if (line.TryGetProperty("text", out var textEl) && textEl.ValueKind == JsonValueKind.String)
+                    text = textEl.GetString() ?? "♪";
+
+                if (line.TryGetProperty("time", out var timeEl) &&
+                    timeEl.ValueKind == JsonValueKind.Object &&
+                    timeEl.TryGetProperty("total", out var totalEl) &&
+                    totalEl.ValueKind == JsonValueKind.Number)
+                {
+                    startMs = (int)Math.Round(totalEl.GetDouble() * 1000.0);
+                }
             }
 
             result.Add(new SyncedLyricLine
@@ -249,73 +455,77 @@ public class MusixmatchClient
             });
         }
 
-        AppLogger.Log($"Richsync parsed line count={result.Count}");
+        AppLogger.Log($"Subtitle parsed line count={result.Count}");
         return result;
     }
 
-    private List<SyncedLyricLine> GetSyncedFromMacro(JsonElement macroCalls)
+    private List<SyncedLyricLine> GetUnsyncedFromMacro(JsonElement macroCalls)
     {
         var result = new List<SyncedLyricLine>();
-        AppLogger.Log("GetSyncedFromMacro begin");
+        AppLogger.Log("GetUnsyncedFromMacro begin");
 
-        if (!macroCalls.TryGetProperty("track.subtitles.get", out var subtitlesGet))
+        if (macroCalls.ValueKind != JsonValueKind.Object)
         {
-            AppLogger.Log("Macro missing track.subtitles.get");
+            AppLogger.Log($"GetUnsyncedFromMacro: macroCalls is {macroCalls.ValueKind}, expected Object");
             return result;
         }
 
-        if (!subtitlesGet.TryGetProperty("message", out var message))
+        if (!macroCalls.TryGetProperty("track.lyrics.get", out var lyricsGet) ||
+            lyricsGet.ValueKind != JsonValueKind.Object)
         {
-            AppLogger.Log("track.subtitles.get missing message");
+            AppLogger.Log("Macro missing track.lyrics.get");
             return result;
         }
 
-        if (!message.TryGetProperty("body", out var body))
+        if (!lyricsGet.TryGetProperty("message", out var message) ||
+            message.ValueKind != JsonValueKind.Object)
         {
-            AppLogger.Log("track.subtitles.get missing body");
+            AppLogger.Log("track.lyrics.get missing message");
             return result;
         }
 
-        if (!body.TryGetProperty("subtitle_list", out var subtitleList))
+        if (!message.TryGetProperty("body", out var body) ||
+            body.ValueKind != JsonValueKind.Object)
         {
-            AppLogger.Log("track.subtitles.get missing subtitle_list");
+            AppLogger.Log("track.lyrics.get missing body");
             return result;
         }
 
-        if (subtitleList.ValueKind != JsonValueKind.Array || subtitleList.GetArrayLength() == 0)
+        if (!body.TryGetProperty("lyrics", out var lyrics) ||
+            lyrics.ValueKind != JsonValueKind.Object)
         {
-            AppLogger.Log("subtitle_list empty");
+            AppLogger.Log("track.lyrics.get missing lyrics object");
             return result;
         }
 
-        var subtitle = subtitleList[0].GetProperty("subtitle");
-        string subtitleBody = subtitle.GetProperty("subtitle_body").GetString() ?? "";
-        AppLogger.Log($"Subtitle body length={subtitleBody.Length}");
+        if (!lyrics.TryGetProperty("lyrics_body", out var lyricsBodyEl) ||
+            lyricsBodyEl.ValueKind != JsonValueKind.String)
+        {
+            AppLogger.Log("lyrics.lyrics_body missing");
+            return result;
+        }
 
-        if (string.IsNullOrWhiteSpace(subtitleBody))
+        string lyricsBody = lyricsBodyEl.GetString() ?? "";
+        AppLogger.Log($"Unsynced lyrics body length={lyricsBody.Length}");
+
+        if (string.IsNullOrWhiteSpace(lyricsBody))
             return result;
 
-        using var subtitleDoc = JsonDocument.Parse(subtitleBody);
+        var rawLines = lyricsBody
+            .Split('\n', StringSplitOptions.TrimEntries)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToArray();
 
-        foreach (var line in subtitleDoc.RootElement.EnumerateArray())
+        for (int i = 0; i < rawLines.Length; i++)
         {
-            string text = line.TryGetProperty("text", out var textEl) ? textEl.GetString() ?? "♪" : "♪";
-            int startMs = 0;
-
-            if (line.TryGetProperty("time", out var timeEl) &&
-                timeEl.TryGetProperty("total", out var totalEl))
-            {
-                startMs = (int)(totalEl.GetDouble() * 1000);
-            }
-
             result.Add(new SyncedLyricLine
             {
-                Text = text,
-                StartTimeMs = startMs
+                Text = rawLines[i],
+                StartTimeMs = i * 4000
             });
         }
 
-        AppLogger.Log($"Subtitle parsed line count={result.Count}");
+        AppLogger.Log($"Unsynced parsed line count={result.Count}");
         return result;
     }
 

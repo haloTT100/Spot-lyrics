@@ -1,57 +1,84 @@
-﻿<Window x:Class="lyrics_overlay.MainWindow"
+﻿
+<Window x:Class="lyrics_overlay.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:lyrics_overlay"
+        Title="Lyrics Overlay"
+        Width="900"
+        Height="220"
         WindowStyle="None"
         AllowsTransparency="True"
         Background="Transparent"
         Topmost="True"
         ShowInTaskbar="False"
-        ResizeMode="CanResizeWithGrip"
-        MinWidth="320"
-        MinHeight="120">
+        ResizeMode="NoResize">
     <Window.Resources>
-        <local:LineOpacityConverter x:Key="LineOpacityConverter"/>
-        <local:LineFontSizeConverter x:Key="LineFontSizeConverter"/>
-        <local:LineWeightConverter x:Key="LineWeightConverter"/>
+        <local:LineOpacityConverter x:Key="LineOpacityConverter" />
+        <local:LineFontSizeConverter x:Key="LineFontSizeConverter" />
+        <local:LineWeightConverter x:Key="LineWeightConverter" />
+        <local:BoolToVisibilityConverter x:Key="BoolToVisibilityConverter" />
+        <local:InverseBoolToVisibilityConverter x:Key="InverseBoolToVisibilityConverter" />
     </Window.Resources>
 
     <Border x:Name="OverlayBorder"
-            Background="#66000000"
-            BorderBrush="#44FFFFFF"
-            BorderThickness="1"
-            CornerRadius="14"
-            Padding="18"
-            SnapsToDevicePixels="True">
-        <Grid>
-            <ItemsControl x:Name="LyricsItemsControl"
-                          ItemsSource="{Binding VisibleLyrics}">
-                <ItemsControl.ItemsPanel>
-                    <ItemsPanelTemplate>
-                        <StackPanel VerticalAlignment="Center"/>
-                    </ItemsPanelTemplate>
-                </ItemsControl.ItemsPanel>
-
-                <ItemsControl.ItemTemplate>
-                    <DataTemplate>
+            Background="Transparent"
+            BorderBrush="Transparent"
+            BorderThickness="0"
+            CornerRadius="0"
+            Padding="4">
+        <ItemsControl x:Name="LyricsItemsControl"
+                      HorizontalAlignment="Stretch"
+                      VerticalAlignment="Center">
+            <ItemsControl.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <StackPanel Orientation="Vertical" />
+                </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+                <DataTemplate DataType="{x:Type local:DisplayLyricLine}">
+                    <Grid Margin="0,4,0,4">
                         <TextBlock Text="{Binding Text}"
-                                TextAlignment="Center"
-                                TextWrapping="Wrap"
-                                Margin="0,4"
-                                Foreground="White"
-                                Opacity="{Binding DistanceFromCurrent, Converter={StaticResource LineOpacityConverter}}"
-                                FontSize="{Binding DistanceFromCurrent, Converter={StaticResource LineFontSizeConverter}}"
-                                FontWeight="{Binding DistanceFromCurrent, Converter={StaticResource LineWeightConverter}}">
+                                   Visibility="{Binding IsKaraokeLine, Converter={StaticResource InverseBoolToVisibilityConverter}}"
+                                   TextAlignment="Center"
+                                   TextWrapping="Wrap"
+                                   Opacity="{Binding DistanceFromCurrent, Converter={StaticResource LineOpacityConverter}}"
+                                   FontSize="{Binding DistanceFromCurrent, Converter={StaticResource LineFontSizeConverter}}"
+                                   FontWeight="{Binding DistanceFromCurrent, Converter={StaticResource LineWeightConverter}}"
+                                   Foreground="White">
                             <TextBlock.Effect>
-                                <DropShadowEffect Color="Black"
-                                                ShadowDepth="0"
-                                                BlurRadius="2"
-                                                Opacity="1"/>
+                                <DropShadowEffect BlurRadius="8" ShadowDepth="0" Color="Black" Opacity="0.9"/>
                             </TextBlock.Effect>
                         </TextBlock>
-                    </DataTemplate>
-                </ItemsControl.ItemTemplate>
-            </ItemsControl>
-        </Grid>
+
+                        <ItemsControl ItemsSource="{Binding Segments}"
+                                      Visibility="{Binding IsKaraokeLine, Converter={StaticResource BoolToVisibilityConverter}}"
+                                      HorizontalAlignment="Center">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <WrapPanel Orientation="Horizontal" HorizontalAlignment="Center" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate DataType="{x:Type local:DisplayKaraokeSegment}">
+                                    <TextBlock Text="{Binding Text}"
+                                               Margin="0"
+                                               Padding="0"
+                                               TextAlignment="Center"
+                                               TextWrapping="NoWrap"
+                                               FontSize="{Binding RelativeSource={RelativeSource AncestorType=ItemsControl}, Path=DataContext.DistanceFromCurrent, Converter={StaticResource LineFontSizeConverter}}"
+                                               FontWeight="{Binding RelativeSource={RelativeSource AncestorType=ItemsControl}, Path=DataContext.DistanceFromCurrent, Converter={StaticResource LineWeightConverter}}"
+                                               Foreground="{Binding ForegroundBrush}"
+                                               Opacity="{Binding RelativeSource={RelativeSource AncestorType=ItemsControl}, Path=DataContext.DistanceFromCurrent, Converter={StaticResource LineOpacityConverter}}">
+                                        <TextBlock.Effect>
+                                            <DropShadowEffect BlurRadius="8" ShadowDepth="0" Color="Black" Opacity="0.95"/>
+                                        </TextBlock.Effect>
+                                    </TextBlock>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Grid>
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
     </Border>
 </Window>
