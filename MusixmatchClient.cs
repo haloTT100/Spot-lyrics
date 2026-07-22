@@ -1,47 +1,112 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Kawazu;
 
 namespace lyrics_overlay;
 
-public class SyncedLyricLine
-{
-    public string Text { get; set; } = "";
-    public int StartTimeMs { get; set; }
-    public string? Performer { get; set; }
-}
-
-public class KaraokeWord
-{
-    public string Word { get; set; } = "";
-    public int OffsetMs { get; set; }
-    public int DurationMs { get; set; }
-}
-
-public class KaraokeLine
-{
-    public int StartTimeMs { get; set; }
-    public int EndTimeMs { get; set; }
-    public string? Performer { get; set; }
-    public List<KaraokeWord> Words { get; set; } = new();
-
-    public string FullText => string.Concat(Words.Select(w => w.Word));
-}
 
 public class MusixmatchClient
 {
     private const string BaseUrl = "https://apic-appmobile.musixmatch.com/ws/1.1/";
     private readonly HttpClient _http = new();
 
+    private readonly KawazuConverter _kawazu;
+    private readonly Dictionary<string, string> _romanizeCache = new(StringComparer.Ordinal);
+
     public string UserToken { get; private set; } = "";
     public List<KaraokeLine> LastKaraokeLines { get; private set; } = new();
+    public bool RomanizeLyrics { get; set; } = true;
+
+    private async Task<string> TransformLyricTextAsync(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || !RomanizeLyrics)
+            return text;
+
+        if (_romanizeCache.TryGetValue(text, out var cached))
+            return cached;
+
+        string transformed = text;
+
+        try
+        {
+            if (ContainsJapanese(text))
+            {
+                transformed = await _kawazu.Convert(
+                    text,
+                    To.Romaji,
+                    Mode.Spaced,
+                    RomajiSystem.Hepburn,
+                    "",
+                    "");
+            }
+            else if (ContainsCyrillic(text))
+            {
+                transformed = TransliterateCyrillic(text);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log($"Romanization failed for '{text}': {ex.Message}");
+            transformed = text;
+        }
+
+        transformed = string.IsNullOrWhiteSpace(transformed) ? text : transformed;
+        _romanizeCache[text] = transformed;
+        return transformed;
+    }
+
+private static bool ContainsCyrillic(string text) =>
+    text.Any(ch => (ch >= '\u0400' && ch <= '\u04FF') || (ch >= '\u0500' && ch <= '\u052F'));
+
+private static bool ContainsJapanese(string text) =>
+    text.Any(ch =>
+        (ch >= '\u3040' && ch <= '\u309F') ||
+        (ch >= '\u30A0' && ch <= '\u30FF') ||
+        (ch >= '\u4E00' && ch <= '\u9FFF'));
+
+    private static string TransliterateCyrillic(string text)
+    {
+        var map = new Dictionary<char, string>
+        {
+            ['А']="A", ['а']="a", ['Б']="B", ['б']="b", ['В']="V", ['в']="v",
+            ['Г']="G", ['г']="g", ['Д']="D", ['д']="d", ['Е']="E", ['е']="e",
+            ['Ё']="Yo", ['ё']="yo", ['Ж']="Zh", ['ж']="zh", ['З']="Z", ['з']="z",
+            ['И']="I", ['и']="i", ['Й']="Y", ['й']="y", ['К']="K", ['к']="k",
+            ['Л']="L", ['л']="l", ['М']="M", ['м']="m", ['Н']="N", ['н']="n",
+            ['О']="O", ['о']="o", ['П']="P", ['п']="p", ['Р']="R", ['р']="r",
+            ['С']="S", ['с']="s", ['Т']="T", ['т']="t", ['У']="U", ['у']="u",
+            ['Ф']="F", ['ф']="f", ['Х']="Kh", ['х']="kh", ['Ц']="Ts", ['ц']="ts",
+            ['Ч']="Ch", ['ч']="ch", ['Ш']="Sh", ['ш']="sh", ['Щ']="Shch", ['щ']="shch",
+            ['Ы']="Y", ['ы']="y", ['Э']="E", ['э']="e", ['Ю']="Yu", ['ю']="yu",
+            ['Я']="Ya", ['я']="ya", ['Ь']="", ['ь']="", ['Ъ']="", ['ъ']=""
+        };
+
+        var sb = new System.Text.StringBuilder(text.Length * 2);
+        foreach (char ch in text)
+            sb.Append(map.TryGetValue(ch, out var s) ? s : ch.ToString());
+
+        return sb.ToString();
+    }
 
     public MusixmatchClient()
     {
         AppLogger.Log("MusixmatchClient ctor");
+
+        string baseDir = AppContext.BaseDirectory;
+        string ipaDicPath = Path.Combine(baseDir, "IpaDic");
+
+        AppLogger.Log($"Kawazu dictionary path: {ipaDicPath}");
+
+        if (!Directory.Exists(ipaDicPath))
+            throw new DirectoryNotFoundException($"Kawazu dictionary folder not found: {ipaDicPath}");
+
+        _kawazu = new KawazuConverter(ipaDicPath);
 
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Host", "apic-appmobile.musixmatch.com");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("authority", "apic-appmobile.musixmatch.com");
@@ -150,7 +215,7 @@ public class MusixmatchClient
         if (hasSubtitles)
         {
             AppLogger.Log("Attempting subtitle parse from macro");
-            var synced = GetSyncedFromMacro(macroCalls);
+            var synced = await GetSyncedFromMacroAsync(macroCalls);
             AppLogger.Log($"Subtitle parse returned {synced.Count} lines");
             if (synced.Count > 0)
                 return synced;
@@ -159,7 +224,7 @@ public class MusixmatchClient
         if (hasLyrics || hasLyricsCrowd)
         {
             AppLogger.Log("Attempting unsynced lyric parse from macro");
-            var unsynced = GetUnsyncedFromMacro(macroCalls);
+            var unsynced = await GetUnsyncedFromMacroAsync(macroCalls);
             AppLogger.Log($"Unsynced parse returned {unsynced.Count} lines");
             if (unsynced.Count > 0)
                 return unsynced;
@@ -302,7 +367,7 @@ public class MusixmatchClient
 
                     string wordText =
                         wordEl.TryGetProperty("c", out var cEl) && cEl.ValueKind == JsonValueKind.String
-                            ? cEl.GetString() ?? ""
+                            ? await TransformLyricTextAsync(cEl.GetString() ?? "")
                             : "";
 
                     double wordOffsetSec =
@@ -359,7 +424,7 @@ public class MusixmatchClient
         return result;
     }
 
-    private List<SyncedLyricLine> GetSyncedFromMacro(JsonElement macroCalls)
+    private async Task<List<SyncedLyricLine>> GetSyncedFromMacroAsync(JsonElement macroCalls)
     {
         var result = new List<SyncedLyricLine>();
         AppLogger.Log("GetSyncedFromMacro begin");
@@ -437,7 +502,7 @@ public class MusixmatchClient
             if (line.ValueKind == JsonValueKind.Object)
             {
                 if (line.TryGetProperty("text", out var textEl) && textEl.ValueKind == JsonValueKind.String)
-                    text = textEl.GetString() ?? "♪";
+                    text = await TransformLyricTextAsync(textEl.GetString() ?? "♪");
 
                 if (line.TryGetProperty("time", out var timeEl) &&
                     timeEl.ValueKind == JsonValueKind.Object &&
@@ -459,7 +524,7 @@ public class MusixmatchClient
         return result;
     }
 
-    private List<SyncedLyricLine> GetUnsyncedFromMacro(JsonElement macroCalls)
+    private async Task<List<SyncedLyricLine>> GetUnsyncedFromMacroAsync(JsonElement macroCalls)
     {
         var result = new List<SyncedLyricLine>();
         AppLogger.Log("GetUnsyncedFromMacro begin");
@@ -520,7 +585,7 @@ public class MusixmatchClient
         {
             result.Add(new SyncedLyricLine
             {
-                Text = rawLines[i],
+                Text = await TransformLyricTextAsync(rawLines[i]),
                 StartTimeMs = i * 4000
             });
         }
@@ -563,4 +628,28 @@ public class MusixmatchClient
         return string.Join("&", parameters.Select(kvp =>
             $"{Uri.EscapeDataString(kvp.Key)}={Uri.EscapeDataString(kvp.Value ?? "")}"));
     }
+}
+
+public class SyncedLyricLine
+{
+    public string Text { get; set; } = "";
+    public int StartTimeMs { get; set; }
+    public string? Performer { get; set; }
+}
+
+public class KaraokeWord
+{
+    public string Word { get; set; } = "";
+    public int OffsetMs { get; set; }
+    public int DurationMs { get; set; }
+}
+
+public class KaraokeLine
+{
+    public int StartTimeMs { get; set; }
+    public int EndTimeMs { get; set; }
+    public string? Performer { get; set; }
+    public List<KaraokeWord> Words { get; set; } = new();
+
+    public string FullText => string.Concat(Words.Select(w => w.Word));
 }
