@@ -19,6 +19,7 @@ using Forms = System.Windows.Forms;
 using Drawing = System.Drawing;
 using WpfApp = System.Windows.Application;
 
+
 namespace lyrics_overlay;
 
 public partial class MainWindow : Window
@@ -45,6 +46,7 @@ public partial class MainWindow : Window
     private List<SyncedLyricLine> _syncedLyrics = new();
     private List<KaraokeLine> _karaokeLyrics = new();
     private DispatcherTimer? _spotifyPollTimer;
+    private string _lastKaraokeRenderKey = "";
     private string _currentTrackId = "";
     private string _lastDisplayedText = "";
     private bool _pollInProgress = false;
@@ -52,6 +54,11 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, List<SyncedLyricLine>> _lyricsCache = new();
     private readonly Dictionary<string, List<KaraokeLine>> _karaokeCache = new();
     private readonly HashSet<string> _noLyricsCache = new();
+
+    private DispatcherTimer? _renderTimer;
+    private int _baseProgressMs = 0;
+    private DateTime _baseProgressUtc = DateTime.UtcNow;
+    private bool _isPlaying = false;
 
     public List<DisplayLyricLine> VisibleLyrics { get; set; } = new();
 
@@ -64,9 +71,54 @@ public partial class MainWindow : Window
     private bool _restoringWindowSettings = false;
     private int _lastProgressMs = 0;
 
-    private static readonly System.Windows.Media.SolidColorBrush SungWordBrush = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(255, 255, 255, 255));
-    private static readonly System.Windows.Media.SolidColorBrush ActiveWordBrush = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(255, 255, 230, 120));
-    private static readonly System.Windows.Media.SolidColorBrush UpcomingWordBrush = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(150, 255, 255, 255));
+    private static readonly System.Windows.Media.Color SungWordColor =
+        System.Windows.Media.Color.FromArgb(255, 255, 255, 255);
+
+    private static readonly System.Windows.Media.Color ActiveWordStartColor =
+        System.Windows.Media.Color.FromArgb(170, 255, 255, 255);
+
+    private static readonly System.Windows.Media.Color ActiveWordEndColor =
+        System.Windows.Media.Color.FromArgb(255, 255, 230, 120);
+
+    private static readonly System.Windows.Media.Color UpcomingWordColor =
+        System.Windows.Media.Color.FromArgb(120, 255, 255, 255);
+
+    private static readonly System.Windows.Media.SolidColorBrush SungWordBrush =
+        CreateFrozenBrush(SungWordColor);
+
+    private static readonly System.Windows.Media.SolidColorBrush UpcomingWordBrush =
+        CreateFrozenBrush(UpcomingWordColor);
+
+    static System.Windows.Media.SolidColorBrush CreateFrozenBrush(System.Windows.Media.Color color)
+    {
+        var brush = new System.Windows.Media.SolidColorBrush(color);
+        brush.Freeze();
+        return brush;
+    }
+
+    static System.Windows.Media.Color LerpColor(System.Windows.Media.Color from, System.Windows.Media.Color to, double t)
+    {
+        t = Math.Max(0.0, Math.Min(1.0, t));
+
+        byte a = (byte)Math.Round(from.A + ((to.A - from.A) * t));
+        byte r = (byte)Math.Round(from.R + ((to.R - from.R) * t));
+        byte g = (byte)Math.Round(from.G + ((to.G - from.G) * t));
+        byte b = (byte)Math.Round(from.B + ((to.B - from.B) * t));
+
+        return System.Windows.Media.Color.FromArgb(a, r, g, b);
+    }
+
+    static double EaseOutCubic(double t)
+    {
+        t = Math.Max(0.0, Math.Min(1.0, t));
+        return 1.0 - Math.Pow(1.0 - t, 3.0);
+    }
+
+    static double EaseInOutSine(double t)
+{
+    t = Math.Max(0.0, Math.Min(1.0, t));
+    return -(Math.Cos(Math.PI * t) - 1.0) / 2.0;
+}
 
     public MainWindow()
     {
@@ -149,10 +201,15 @@ public partial class MainWindow : Window
                 await _musixmatch.EnsureTokenAsync();
 
                 StartSpotifyPolling();
+                StartRenderTimer();
 
                 var state = await _spotify.GetPlaybackAsync(_auth.AccessToken);
                 if (state != null)
                 {
+                    _baseProgressMs = state.ProgressMs;
+                    _baseProgressUtc = DateTime.UtcNow;
+                    _isPlaying = state.IsPlaying;
+                    _lastProgressMs = state.ProgressMs;
                     AppLogger.Log($"Initial playback state: {state.Artist} - {state.Title} | TrackId={state.TrackId} | ProgressMs={state.ProgressMs} | IsPlaying={state.IsPlaying}");
                     SetOverlayMessage($"{state.Artist} - {state.Title}");
                 }
@@ -172,13 +229,28 @@ public partial class MainWindow : Window
         };
     }
 
-    static System.Windows.Media.SolidColorBrush CreateFrozenBrush(System.Windows.Media.Color color)
+    void StartRenderTimer()
     {
-        var brush = new System.Windows.Media.SolidColorBrush(color);
-        brush.Freeze();
-        return brush;
-    }
+        _renderTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(16)
+        };
 
+        _renderTimer.Tick += (_, __) =>
+        {
+            int progressMs = _baseProgressMs;
+
+            if (_isPlaying)
+            {
+                progressMs += (int)(DateTime.UtcNow - _baseProgressUtc).TotalMilliseconds;
+            }
+
+            _lastProgressMs = progressMs;
+            RefreshVisibleLyrics(progressMs);
+        };
+
+        _renderTimer.Start();
+    }
     void StartSpotifyPolling()
     {
         AppLogger.Log("StartSpotifyPolling invoked");
@@ -405,12 +477,14 @@ public partial class MainWindow : Window
         }
 
         VisibleLyrics = lines;
-        LyricsItemsControl.ItemsSource = null;
         LyricsItemsControl.ItemsSource = VisibleLyrics;
     }
 
     void RefreshVisibleKaraokeLyrics(int progressMs)
     {
+        if (_karaokeLyrics == null || _karaokeLyrics.Count == 0)
+            return;
+
         int currentIndex = 0;
 
         for (int i = 0; i < _karaokeLyrics.Count; i++)
@@ -428,26 +502,36 @@ public partial class MainWindow : Window
         for (int i = start; i <= end; i++)
         {
             var line = _karaokeLyrics[i];
-            bool isCurrent = i == currentIndex;
 
             lines.Add(new DisplayLyricLine
             {
                 Text = string.IsNullOrWhiteSpace(line.FullText) ? " " : line.FullText,
                 DistanceFromCurrent = i - currentIndex,
                 IsKaraokeLine = true,
-                Segments = BuildKaraokeSegments(line, progressMs, isCurrent)
+                Segments = BuildKaraokeSegments(line, progressMs)
             });
         }
 
-        string currentDisplay = _karaokeLyrics[currentIndex].FullText;
+        string currentDisplay = string.IsNullOrWhiteSpace(_karaokeLyrics[currentIndex].FullText)
+            ? " "
+            : _karaokeLyrics[currentIndex].FullText;
+
         if (!string.Equals(currentDisplay, _lastDisplayedText, StringComparison.Ordinal))
         {
             _lastDisplayedText = currentDisplay;
             AppLogger.Log($"Displaying karaoke currentIndex={currentIndex}, previousLines={previousLinesToShow}, nextLines={end - currentIndex}, current='{_lastDisplayedText}'");
         }
 
+        string renderKey = string.Join("|", lines.Select(line =>
+            $"{line.DistanceFromCurrent}:{string.Join("~", line.Segments.Select(s =>
+                $"{s.Text}#{(s.ForegroundBrush as System.Windows.Media.SolidColorBrush)?.Color.ToString() ?? s.ForegroundBrush.ToString()}"))}"));
+
+        if (renderKey == _lastKaraokeRenderKey)
+            return;
+
+        _lastKaraokeRenderKey = renderKey;
+
         VisibleLyrics = lines;
-        LyricsItemsControl.ItemsSource = null;
         LyricsItemsControl.ItemsSource = VisibleLyrics;
     }
 
@@ -463,46 +547,108 @@ public partial class MainWindow : Window
         return (start, end, previousLinesToShow);
     }
 
-    List<DisplayKaraokeSegment> BuildKaraokeSegments(KaraokeLine line, int progressMs, bool isCurrentLine)
+    List<DisplayKaraokeSegment> BuildKaraokeSegments(KaraokeLine line, int progressMs)
     {
-        if (line.Words.Count == 0)
+        var segments = new List<DisplayKaraokeSegment>();
+
+        if (line.Words == null || line.Words.Count == 0)
         {
-            return new List<DisplayKaraokeSegment>
+            segments.Add(new DisplayKaraokeSegment
             {
-                new DisplayKaraokeSegment
-                {
-                    Text = string.IsNullOrWhiteSpace(line.FullText) ? " " : line.FullText,
-                    ForegroundBrush = isCurrentLine ? ActiveWordBrush : UpcomingWordBrush
-                }
-            };
-        }
-
-        int relativeMs = Math.Max(0, progressMs - line.StartTimeMs);
-        var rawSegments = new List<DisplayKaraokeSegment>();
-
-        foreach (var word in line.Words)
-        {
-            bool completed = relativeMs >= word.OffsetMs + word.DurationMs;
-            bool active = relativeMs >= word.OffsetMs && relativeMs < word.OffsetMs + word.DurationMs;
-
-            System.Windows.Media.Brush brush;
-            if (!isCurrentLine)
-                brush = line.StartTimeMs < progressMs ? SungWordBrush : UpcomingWordBrush;
-            else if (completed)
-                brush = SungWordBrush;
-            else if (active)
-                brush = ActiveWordBrush;
-            else
-                brush = UpcomingWordBrush;
-
-            rawSegments.Add(new DisplayKaraokeSegment
-            {
-                Text = word.Word,
-                ForegroundBrush = brush
+                Text = " ",
+                ForegroundBrush = UpcomingWordBrush
             });
+            return segments;
         }
 
-        return MergeSegments(rawSegments);
+        for (int i = 0; i < line.Words.Count; i++)
+        {
+            var word = line.Words[i];
+            string text = word.Word ?? "";
+
+            if (string.IsNullOrEmpty(text))
+                continue;
+
+            int wordStartMs = line.StartTimeMs + word.OffsetMs;
+
+            int wordEndMs;
+            if (word.DurationMs > 0)
+            {
+                wordEndMs = wordStartMs + word.DurationMs;
+            }
+            else if (i + 1 < line.Words.Count)
+            {
+                wordEndMs = line.StartTimeMs + line.Words[i + 1].OffsetMs;
+            }
+            else
+            {
+                wordEndMs = line.EndTimeMs > wordStartMs ? line.EndTimeMs : wordStartMs + 900;
+            }
+
+            if (wordEndMs <= wordStartMs)
+                wordEndMs = wordStartMs + 120;
+
+            if (progressMs < wordStartMs)
+            {
+                segments.Add(new DisplayKaraokeSegment
+                {
+                    Text = text,
+                    ForegroundBrush = UpcomingWordBrush
+                });
+                continue;
+            }
+
+            if (progressMs >= wordEndMs)
+            {
+                segments.Add(new DisplayKaraokeSegment
+                {
+                    Text = text,
+                    ForegroundBrush = SungWordBrush
+                });
+                continue;
+            }
+
+            double rawT = (double)(progressMs - wordStartMs) / (wordEndMs - wordStartMs);
+            double easedT = EaseInOutSine(rawT);
+
+            int charCount = text.Length;
+            double charProgress = easedT * charCount;
+
+            int fullChars = Math.Clamp((int)Math.Floor(charProgress), 0, charCount);
+            double currentCharT = charProgress - fullChars;
+
+            if (fullChars > 0)
+            {
+                segments.Add(new DisplayKaraokeSegment
+                {
+                    Text = text.Substring(0, fullChars),
+                    ForegroundBrush = SungWordBrush
+                });
+            }
+
+            if (fullChars < charCount)
+            {
+                var currentChar = text.Substring(fullChars, 1);
+                var currentCharColor = LerpColor(ActiveWordStartColor, ActiveWordEndColor, currentCharT);
+
+                segments.Add(new DisplayKaraokeSegment
+                {
+                    Text = currentChar,
+                    ForegroundBrush = CreateFrozenBrush(currentCharColor)
+                });
+
+                if (fullChars + 1 < charCount)
+                {
+                    segments.Add(new DisplayKaraokeSegment
+                    {
+                        Text = text.Substring(fullChars + 1),
+                        ForegroundBrush = UpcomingWordBrush
+                    });
+                }
+            }
+        }
+
+        return MergeSegments(segments);
     }
 
     List<DisplayKaraokeSegment> MergeSegments(List<DisplayKaraokeSegment> rawSegments)
