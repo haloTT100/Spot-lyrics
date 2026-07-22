@@ -9,6 +9,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -28,8 +30,15 @@ jobs:
       - name: Publish
         run: dotnet publish "lyrics overlay.csproj" --no-restore --configuration Release --runtime win-x64 --self-contained false --output ./publish
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Zip artifact
+        run: Compress-Archive -Path ./publish/* -DestinationPath ./Spot-lyrics.zip
+
+      - name: Create or update GitHub Release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
         with:
-          name: Spot-lyrics
-          path: ./publish
+          tag_name: latest
+          name: Latest Build
+          body: "Automatically built from the latest commit on main."
+          prerelease: false
+          files: ./Spot-lyrics.zip
