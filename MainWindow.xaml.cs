@@ -18,6 +18,7 @@ using System.Windows.Threading;
 using Forms = System.Windows.Forms;
 using Drawing = System.Drawing;
 using WpfApp = System.Windows.Application;
+using System.Collections.ObjectModel;
 
 
 namespace lyrics_overlay;
@@ -60,7 +61,7 @@ public partial class MainWindow : Window
     private DateTime _baseProgressUtc = DateTime.UtcNow;
     private bool _isPlaying = false;
 
-    public List<DisplayLyricLine> VisibleLyrics { get; set; } = new();
+    public ObservableCollection<DisplayLyricLine> VisibleLyrics { get; } = new();
 
     private readonly string _windowSettingsPath =
         System.IO.Path.Combine(
@@ -124,6 +125,7 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         DataContext = this;
+        LyricsItemsControl.ItemsSource = VisibleLyrics;
         AppLogger.Log("MainWindow ctor");
 
         StateChanged += (_, __) =>
@@ -210,6 +212,9 @@ public partial class MainWindow : Window
                     _baseProgressUtc = DateTime.UtcNow;
                     _isPlaying = state.IsPlaying;
                     _lastProgressMs = state.ProgressMs;
+                    _baseProgressMs = state.ProgressMs;
+                    _baseProgressUtc = DateTime.UtcNow;
+                    _isPlaying = state.IsPlaying;
                     AppLogger.Log($"Initial playback state: {state.Artist} - {state.Title} | TrackId={state.TrackId} | ProgressMs={state.ProgressMs} | IsPlaying={state.IsPlaying}");
                     SetOverlayMessage($"{state.Artist} - {state.Title}");
                 }
@@ -283,11 +288,19 @@ public partial class MainWindow : Window
                     _karaokeLyrics.Clear();
                     _currentTrackHasNoLyrics = false;
                     _lastProgressMs = 0;
+                    _baseProgressMs = 0;
+                    _baseProgressUtc = DateTime.UtcNow;
+                    _isPlaying = false;
+                    _lastKaraokeRenderKey = "";
+                    ReplaceVisibleLyrics(Array.Empty<DisplayLyricLine>());
                     SetOverlayMessage("Nothing is currently playing.");
                     return;
                 }
 
                 _lastProgressMs = state.ProgressMs;
+                _baseProgressMs = state.ProgressMs;
+                _baseProgressUtc = DateTime.UtcNow;
+                _isPlaying = state.IsPlaying;
 
                 AppLogger.Log($"Spotify state: TrackId={state.TrackId} | Artist={state.Artist} | Title={state.Title} | Album={state.Album} | Uri={state.Uri} | DurationMs={state.DurationMs} | ProgressMs={state.ProgressMs} | IsPlaying={state.IsPlaying}");
 
@@ -296,6 +309,12 @@ public partial class MainWindow : Window
                     AppLogger.Log($"Track change detected. OldTrackId={_currentTrackId}, NewTrackId={state.TrackId}");
 
                     _currentTrackId = state.TrackId;
+                    _lastDisplayedText = "";
+                    _lastKaraokeRenderKey = "";
+                    _baseProgressMs = state.ProgressMs;
+                    _baseProgressUtc = DateTime.UtcNow;
+                    _isPlaying = state.IsPlaying;
+                    ReplaceVisibleLyrics(Array.Empty<DisplayLyricLine>());
                     _lastDisplayedText = "";
                     _syncedLyrics.Clear();
                     _karaokeLyrics.Clear();
@@ -476,8 +495,7 @@ public partial class MainWindow : Window
             AppLogger.Log($"Displaying lyric currentIndex={currentIndex}, previousLines={previousLinesToShow}, nextLines={end - currentIndex}, current='{_lastDisplayedText}'");
         }
 
-        VisibleLyrics = lines;
-        LyricsItemsControl.ItemsSource = VisibleLyrics;
+        ReplaceVisibleLyrics(lines);
     }
 
     void RefreshVisibleKaraokeLyrics(int progressMs)
@@ -531,8 +549,7 @@ public partial class MainWindow : Window
 
         _lastKaraokeRenderKey = renderKey;
 
-        VisibleLyrics = lines;
-        LyricsItemsControl.ItemsSource = VisibleLyrics;
+        ReplaceVisibleLyrics(lines);
     }
 
     (int start, int end, int previousLinesToShow) CalculateVisibleRange(int currentIndex, int totalCount)
@@ -651,6 +668,20 @@ public partial class MainWindow : Window
         return MergeSegments(segments);
     }
 
+
+
+    static bool SameBrush(System.Windows.Media.Brush a, System.Windows.Media.Brush b)
+    {
+        if (ReferenceEquals(a, b))
+            return true;
+
+        if (a is System.Windows.Media.SolidColorBrush sa &&
+            b is System.Windows.Media.SolidColorBrush sb)
+            return sa.Color == sb.Color;
+
+        return false;
+    }
+
     List<DisplayKaraokeSegment> MergeSegments(List<DisplayKaraokeSegment> rawSegments)
     {
         if (rawSegments.Count <= 1)
@@ -665,7 +696,7 @@ public partial class MainWindow : Window
 
         for (int i = 1; i < rawSegments.Count; i++)
         {
-            if (ReferenceEquals(current.ForegroundBrush, rawSegments[i].ForegroundBrush))
+            if (SameBrush(current.ForegroundBrush, rawSegments[i].ForegroundBrush))
             {
                 current.Text += rawSegments[i].Text;
             }
@@ -684,21 +715,25 @@ public partial class MainWindow : Window
         return merged;
     }
 
+    void ReplaceVisibleLyrics(IEnumerable<DisplayLyricLine> lines)
+    {
+        VisibleLyrics.Clear();
+        foreach (var line in lines)
+            VisibleLyrics.Add(line);
+    }
+
     void SetOverlayMessage(string message)
     {
-        VisibleLyrics = new List<DisplayLyricLine>
+        ReplaceVisibleLyrics(new[]
         {
             new DisplayLyricLine
             {
-                Text = string.IsNullOrWhiteSpace(message) ? " " : message,
+                Text = string.IsNullOrWhiteSpace(message) ? "..." : message,
                 DistanceFromCurrent = 0,
                 IsKaraokeLine = false,
                 Segments = new List<DisplayKaraokeSegment>()
             }
-        };
-
-        LyricsItemsControl.ItemsSource = null;
-        LyricsItemsControl.ItemsSource = VisibleLyrics;
+        });
     }
 
     void SetupTrayIcon()
@@ -1304,6 +1339,13 @@ public class SpotifyClient
         {
             AppLogger.Log("Spotify returned 401 Unauthorized");
             throw new Exception("Token expired");
+        }
+
+        if (resp.StatusCode == HttpStatusCode.Forbidden)
+        {
+            string body = await resp.Content.ReadAsStringAsync();
+            AppLogger.Log($"Spotify returned 403 Forbidden. Body={body}");
+            throw new Exception("Spotify playback API forbidden. Premium account is required, or the saved token belongs to a different account.");
         }
 
         resp.EnsureSuccessStatusCode();
