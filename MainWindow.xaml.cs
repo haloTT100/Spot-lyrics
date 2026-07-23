@@ -1,5 +1,4 @@
-﻿
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -19,9 +18,17 @@ using Forms = System.Windows.Forms;
 using Drawing = System.Drawing;
 using WpfApp = System.Windows.Application;
 using System.Collections.ObjectModel;
-
+using Windows.Media.Control;
 
 namespace lyrics_overlay;
+
+public interface IPlaybackSource
+{
+    string SourceName { get; }
+    bool IsAvailable { get; }
+    Task InitializeAsync();
+    Task<SpotifyPlaybackState?> GetPlaybackAsync();
+}
 
 public partial class MainWindow : Window
 {
@@ -35,9 +42,10 @@ public partial class MainWindow : Window
     [DllImport("user32.dll", SetLastError = true)]
     static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
 
-    private readonly SpotifyAuth _auth = new();
-    private readonly SpotifyClient _spotify = new();
     private readonly MusixmatchClient _musixmatch = new();
+    private IPlaybackSource? _playbackSource;
+    private IPlaybackSource? _spotifySource;
+    private IPlaybackSource? _fallbackSource;
 
     private Forms.NotifyIcon? _trayIcon;
     private bool _isRealExit;
@@ -116,10 +124,10 @@ public partial class MainWindow : Window
     }
 
     static double EaseInOutSine(double t)
-{
-    t = Math.Max(0.0, Math.Min(1.0, t));
-    return -(Math.Cos(Math.PI * t) - 1.0) / 2.0;
-}
+    {
+        t = Math.Max(0.0, Math.Min(1.0, t));
+        return -(Math.Cos(Math.PI * t) - 1.0) / 2.0;
+    }
 
     public MainWindow()
     {
@@ -146,9 +154,7 @@ public partial class MainWindow : Window
                 {
                     ResizeMode = ResizeMode.NoResize;
                     UpdateLayout();
-
                     DragMove();
-
                     ResizeMode = _isResizable ? ResizeMode.CanResizeWithGrip : ResizeMode.NoResize;
                     UpdateLayout();
                 }
@@ -188,33 +194,39 @@ public partial class MainWindow : Window
                 await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
                 ApplyOverlayStyle();
 
-                if (_auth.HasSavedRefreshToken())
+                await _musixmatch.EnsureTokenAsync();
+
+                _spotifySource = new SpotifyWebApiPlaybackSource();
+                _fallbackSource = new SmtcPlaybackSource();
+
+                await _spotifySource.InitializeAsync();
+                if (_spotifySource.IsAvailable)
                 {
-                    AppLogger.Log("Saved Spotify refresh token found");
-                    _auth.LoadSavedRefreshToken();
-                    await _auth.RefreshAsync();
+                    _playbackSource = _spotifySource;
+                    AppLogger.Log("Using Spotify Web API as primary playback source");
                 }
                 else
                 {
-                    AppLogger.Log("No saved Spotify refresh token, starting login flow");
-                    await _auth.LoginAsync();
+                    await _fallbackSource.InitializeAsync();
+                    _playbackSource = _fallbackSource.IsAvailable ? _fallbackSource : null;
+                    AppLogger.Log(_playbackSource != null
+                        ? "Using SMTC as fallback playback source"
+                        : "No playback source is currently available");
                 }
-
-                await _musixmatch.EnsureTokenAsync();
 
                 StartSpotifyPolling();
                 StartRenderTimer();
 
-                var state = await _spotify.GetPlaybackAsync(_auth.AccessToken);
+                var state = _playbackSource != null
+                    ? await _playbackSource.GetPlaybackAsync()
+                    : null;
+
                 if (state != null)
                 {
                     _baseProgressMs = state.ProgressMs;
                     _baseProgressUtc = DateTime.UtcNow;
                     _isPlaying = state.IsPlaying;
                     _lastProgressMs = state.ProgressMs;
-                    _baseProgressMs = state.ProgressMs;
-                    _baseProgressUtc = DateTime.UtcNow;
-                    _isPlaying = state.IsPlaying;
                     AppLogger.Log($"Initial playback state: {state.Artist} - {state.Title} | TrackId={state.TrackId} | ProgressMs={state.ProgressMs} | IsPlaying={state.IsPlaying}");
                     SetOverlayMessage($"{state.Artist} - {state.Title}");
                 }
@@ -246,9 +258,7 @@ public partial class MainWindow : Window
             int progressMs = _baseProgressMs;
 
             if (_isPlaying)
-            {
                 progressMs += (int)(DateTime.UtcNow - _baseProgressUtc).TotalMilliseconds;
-            }
 
             _lastProgressMs = progressMs;
             RefreshVisibleLyrics(progressMs);
@@ -256,6 +266,7 @@ public partial class MainWindow : Window
 
         _renderTimer.Start();
     }
+
     void StartSpotifyPolling()
     {
         AppLogger.Log("StartSpotifyPolling invoked");
@@ -267,22 +278,35 @@ public partial class MainWindow : Window
 
         _spotifyPollTimer.Tick += async (_, __) =>
         {
-            if (_pollInProgress)
-            {
-                AppLogger.Log("Polling tick skipped because previous poll is still running");
-                return;
-            }
-
+            if (_pollInProgress) return;
             _pollInProgress = true;
 
             try
             {
-                AppLogger.Log("Polling tick start");
+                SpotifyPlaybackState? state = null;
 
-                var state = await _spotify.GetPlaybackAsync(_auth.AccessToken);
+                if (_playbackSource != null)
+                    state = await _playbackSource.GetPlaybackAsync();
+
+                // Only switch to fallback if the SOURCE became unavailable (403),
+                // NOT just because state is null (204 = nothing playing)
+                if (_playbackSource == _spotifySource
+                    && _spotifySource != null
+                    && !_spotifySource.IsAvailable  // <-- this is the key check
+                    && _fallbackSource != null)
+                {
+                    await _fallbackSource.InitializeAsync();
+                    if (_fallbackSource.IsAvailable)
+                    {
+                        _playbackSource = _fallbackSource;
+                        AppLogger.Log("Switched playback source to SMTC fallback (Spotify unavailable/forbidden)");
+                        state = await _playbackSource.GetPlaybackAsync();
+                    }
+                }
+
                 if (state == null)
                 {
-                    AppLogger.Log("Spotify state is null / nothing currently playing");
+                    AppLogger.Log("Playback state is null / nothing currently playing");
                     _currentTrackId = "";
                     _syncedLyrics.Clear();
                     _karaokeLyrics.Clear();
@@ -302,7 +326,7 @@ public partial class MainWindow : Window
                 _baseProgressUtc = DateTime.UtcNow;
                 _isPlaying = state.IsPlaying;
 
-                AppLogger.Log($"Spotify state: TrackId={state.TrackId} | Artist={state.Artist} | Title={state.Title} | Album={state.Album} | Uri={state.Uri} | DurationMs={state.DurationMs} | ProgressMs={state.ProgressMs} | IsPlaying={state.IsPlaying}");
+                AppLogger.Log($"Playback state: TrackId={state.TrackId} | Artist={state.Artist} | Title={state.Title} | Album={state.Album} | Uri={state.Uri} | DurationMs={state.DurationMs} | ProgressMs={state.ProgressMs} | IsPlaying={state.IsPlaying}");
 
                 if (state.TrackId != _currentTrackId)
                 {
@@ -315,7 +339,6 @@ public partial class MainWindow : Window
                     _baseProgressUtc = DateTime.UtcNow;
                     _isPlaying = state.IsPlaying;
                     ReplaceVisibleLyrics(Array.Empty<DisplayLyricLine>());
-                    _lastDisplayedText = "";
                     _syncedLyrics.Clear();
                     _karaokeLyrics.Clear();
                     _currentTrackHasNoLyrics = false;
@@ -375,7 +398,7 @@ public partial class MainWindow : Window
                 }
                 else if (!state.IsPlaying)
                 {
-                    AppLogger.Log("Spotify is paused, not advancing lyric");
+                    AppLogger.Log("Playback is paused, not advancing lyric");
                     if (_currentTrackHasNoLyrics)
                         SetOverlayMessage($"{state.Artist} - {state.Title}");
                 }
@@ -383,24 +406,6 @@ public partial class MainWindow : Window
             catch (Exception ex)
             {
                 AppLogger.Log($"Polling exception: {ex}");
-
-                if (ex.Message.Contains("Token expired", StringComparison.OrdinalIgnoreCase))
-                {
-                    try
-                    {
-                        AppLogger.Log("Spotify token expired, attempting refresh");
-                        await _auth.RefreshAsync();
-                        AppLogger.Log("Spotify token refresh succeeded");
-                    }
-                    catch (Exception refreshEx)
-                    {
-                        AppLogger.Log($"Spotify token refresh failed: {refreshEx}");
-                        SetOverlayMessage($"Spotify refresh failed: {refreshEx.Message}");
-                    }
-
-                    return;
-                }
-
                 SetOverlayMessage(ex.Message);
             }
             finally
@@ -422,6 +427,8 @@ public partial class MainWindow : Window
         return source.Select(line => new KaraokeLine
         {
             StartTimeMs = line.StartTimeMs,
+            EndTimeMs = line.EndTimeMs,
+            Performer = line.Performer,
             Words = (line.Words ?? new List<KaraokeWord>()).Select(word => new KaraokeWord
             {
                 Word = word.Word,
@@ -667,8 +674,6 @@ public partial class MainWindow : Window
 
         return MergeSegments(segments);
     }
-
-
 
     static bool SameBrush(System.Windows.Media.Brush a, System.Windows.Media.Brush b)
     {
@@ -1381,5 +1386,237 @@ public class SpotifyClient
 
         AppLogger.Log($"Spotify parsed state: {state.Artist} - {state.Title} | TrackId={state.TrackId} | Album={state.Album} | Uri={state.Uri} | DurationMs={state.DurationMs} | ProgressMs={state.ProgressMs} | IsPlaying={state.IsPlaying}");
         return state;
+    }
+}
+
+public sealed class SpotifyWebApiPlaybackSource : IPlaybackSource
+{
+    private readonly SpotifyAuth _auth = new();
+    private readonly SpotifyClient _spotify = new();
+
+    public string SourceName => "Spotify Web API";
+    public bool IsAvailable { get; private set; }
+
+    public async Task InitializeAsync()
+    {
+        try
+        {
+            if (_auth.HasSavedRefreshToken())
+            {
+                AppLogger.Log("SpotifyWebApiPlaybackSource: saved refresh token found");
+                _auth.LoadSavedRefreshToken();
+                await _auth.RefreshAsync();
+            }
+            else
+            {
+                AppLogger.Log("SpotifyWebApiPlaybackSource: no saved refresh token, starting login flow");
+                await _auth.LoginAsync();
+            }
+
+            IsAvailable = true;
+            AppLogger.Log("SpotifyWebApiPlaybackSource initialized successfully");
+        }
+        catch (Exception ex)
+        {
+            IsAvailable = false;
+            AppLogger.Log($"SpotifyWebApiPlaybackSource initialization failed: {ex}");
+        }
+    }
+
+    public async Task<SpotifyPlaybackState?> GetPlaybackAsync()
+    {
+        if (!IsAvailable)
+            return null;
+
+        try
+        {
+            return await _spotify.GetPlaybackAsync(_auth.AccessToken);
+        }
+        catch (Exception ex) when (ex.Message.Contains("Token expired", StringComparison.OrdinalIgnoreCase))
+        {
+            AppLogger.Log("SpotifyWebApiPlaybackSource: token expired, refreshing");
+            await _auth.RefreshAsync();
+            return await _spotify.GetPlaybackAsync(_auth.AccessToken);
+        }
+        catch (Exception ex) when (
+            ex.Message.Contains("forbidden", StringComparison.OrdinalIgnoreCase) ||
+            ex.Message.Contains("premium", StringComparison.OrdinalIgnoreCase))
+        {
+            IsAvailable = false;
+            AppLogger.Log($"SpotifyWebApiPlaybackSource unavailable: {ex.Message}");
+            return null;
+        }
+    }
+}
+
+public sealed class SmtcPlaybackSource : IPlaybackSource
+{
+    private GlobalSystemMediaTransportControlsSessionManager? _manager;
+    private GlobalSystemMediaTransportControlsSession? _session;
+
+    public string SourceName => "SMTC";
+    public bool IsAvailable { get; private set; }
+
+    public async Task InitializeAsync()
+    {
+        try
+        {
+            _manager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
+            _manager.SessionsChanged -= Manager_SessionsChanged;
+            _manager.SessionsChanged += Manager_SessionsChanged;
+
+            AttachSession(_manager.GetCurrentSession());
+
+            IsAvailable = _session != null;
+            AppLogger.Log($"SmtcPlaybackSource initialized. SessionAvailable={IsAvailable}");
+        }
+        catch (Exception ex)
+        {
+            IsAvailable = false;
+            AppLogger.Log($"SmtcPlaybackSource initialization failed: {ex.Message}");
+        }
+    }
+
+    private void Manager_SessionsChanged(GlobalSystemMediaTransportControlsSessionManager sender, SessionsChangedEventArgs args)
+    {
+        try
+        {
+            AttachSession(sender.GetCurrentSession());
+            IsAvailable = _session != null;
+            AppLogger.Log($"SMTC sessions changed. SessionAvailable={IsAvailable}");
+        }
+        catch (Exception ex)
+        {
+            IsAvailable = false;
+            AppLogger.Log($"SMTC sessions changed handler failed: {ex.Message}");
+        }
+    }
+
+    private void AttachSession(GlobalSystemMediaTransportControlsSession? session)
+    {
+        if (_session != null)
+        {
+            _session.MediaPropertiesChanged -= Session_MediaPropertiesChanged;
+            _session.PlaybackInfoChanged -= Session_PlaybackInfoChanged;
+            _session.TimelinePropertiesChanged -= Session_TimelinePropertiesChanged;
+        }
+
+        _session = session;
+
+        if (_session != null)
+        {
+            _session.MediaPropertiesChanged += Session_MediaPropertiesChanged;
+            _session.PlaybackInfoChanged += Session_PlaybackInfoChanged;
+            _session.TimelinePropertiesChanged += Session_TimelinePropertiesChanged;
+        }
+    }
+
+    private void Session_MediaPropertiesChanged(GlobalSystemMediaTransportControlsSession sender, MediaPropertiesChangedEventArgs args)
+    {
+        AppLogger.Log("SMTC media properties changed");
+    }
+
+    private void Session_PlaybackInfoChanged(GlobalSystemMediaTransportControlsSession sender, PlaybackInfoChangedEventArgs args)
+    {
+        AppLogger.Log("SMTC playback info changed");
+    }
+
+    private void Session_TimelinePropertiesChanged(GlobalSystemMediaTransportControlsSession sender, TimelinePropertiesChangedEventArgs args)
+    {
+        AppLogger.Log("SMTC timeline changed");
+    }
+
+    public async Task<SpotifyPlaybackState?> GetPlaybackAsync()
+    {
+        try
+        {
+            if (_manager == null)
+            {
+                await InitializeAsync();
+                if (_manager == null)
+                    return null;
+            }
+
+            if (_session == null)
+            {
+                AttachSession(_manager.GetCurrentSession());
+                IsAvailable = _session != null;
+            }
+
+            if (_session == null)
+            {
+                AppLogger.Log("SMTC GetPlaybackAsync: no active session");
+                return null;
+            }
+
+            var props = await _session.TryGetMediaPropertiesAsync();
+            var pbInfo = _session.GetPlaybackInfo();
+            var tlInfo = _session.GetTimelineProperties();
+
+            string title = props?.Title ?? "";
+            string artist = props?.Artist ?? "";
+            string album = props?.AlbumTitle ?? "";
+
+            if (string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(artist))
+            {
+                AppLogger.Log("SMTC GetPlaybackAsync: active session has no usable title/artist");
+                return null;
+            }
+
+            bool isPlaying = pbInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
+
+            TimeSpan currentPosition = tlInfo.Position;
+            if (isPlaying)
+            {
+                double rate = pbInfo.PlaybackRate ?? 1.0;
+                var elapsed = DateTimeOffset.Now - tlInfo.LastUpdatedTime;
+                currentPosition = tlInfo.Position + TimeSpan.FromSeconds(elapsed.TotalSeconds * rate);
+
+                if (currentPosition < TimeSpan.Zero)
+                    currentPosition = TimeSpan.Zero;
+
+                if (tlInfo.EndTime > TimeSpan.Zero && currentPosition > tlInfo.EndTime)
+                    currentPosition = tlInfo.EndTime;
+            }
+
+            int progressMs = (int)Math.Max(0, Math.Round(currentPosition.TotalMilliseconds));
+            int durationMs = (int)Math.Max(0, Math.Round(tlInfo.EndTime.TotalMilliseconds));
+
+            string trackId = BuildFallbackTrackId(artist, title, album, durationMs);
+
+            var state = new SpotifyPlaybackState
+            {
+                TrackId = trackId,
+                Title = title,
+                Artist = artist,
+                Album = album,
+                Uri = "",
+                DurationMs = durationMs,
+                ProgressMs = progressMs,
+                IsPlaying = isPlaying
+            };
+
+            IsAvailable = true;
+
+            AppLogger.Log(
+                $"SMTC parsed state {state.Artist} - {state.Title} " +
+                $"TrackId={state.TrackId} Album={state.Album} Uri={state.Uri} " +
+                $"DurationMs={state.DurationMs} ProgressMs={state.ProgressMs} IsPlaying={state.IsPlaying}");
+
+            return state;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log($"SmtcPlaybackSource GetPlaybackAsync failed: {ex.Message}");
+            IsAvailable = false;
+            return null;
+        }
+    }
+
+    private static string BuildFallbackTrackId(string artist, string title, string album, int durationMs)
+    {
+        string raw = $"{artist}|{title}|{album}|{durationMs}";
+        byte[] bytes = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
+        return Convert.ToHexString(bytes);
     }
 }
