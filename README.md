@@ -10,7 +10,6 @@ It tracks the current song from Spotify, fetches synced lyrics, and renders them
 - SMTC (System Media Transport Controls) fallback when Spotify playback data is unavailable
 - Synced lyric fetching through Musixmatch
 - Karaoke-style per-word highlighting
-- Anti-blink rendering pipeline for smoother lyric updates
 - Tray icon controls for show/hide, drag, resize, and text-only mode
 - Window position and size persistence
 - Romanization support for Japanese and Cyrillic lyrics
@@ -43,8 +42,7 @@ This keeps the overlay responsive while preserving smooth karaoke transitions.
 
 - Windows
 - .NET SDK with WPF support
-- A Spotify account with playback access
-- Internet access for Spotify and lyric lookup
+- A Spotify Premium account with playback access (primary playback source)
 
 ## Setup
 
