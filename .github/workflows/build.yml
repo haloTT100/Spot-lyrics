@@ -1,25 +1,53 @@
-name: Build
+name: Build and Release
 
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
+    types: [closed]
+    branches: ["main"]
 
 jobs:
-  build:
+  release:
+    if: github.event.pull_request.merged == true
     runs-on: windows-latest
     permissions:
       contents: write
 
     steps:
-      - name: Checkout
+      - name: Checkout merged commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Fetch all tags
+        run: git fetch --force --tags
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+
+      - name: Determine next version
+        id: version
+        shell: pwsh
+        run: |
+          $latestTag = git tag --list "v*" --sort=-version:refname | Select-Object -First 1
+
+          if (-not $latestTag) {
+            $newTag = "v1.0.0"
+          } else {
+            if ($latestTag -notmatch '^v(\d+)\.(\d+)\.(\d+)$') {
+              throw "Latest tag '$latestTag' is not valid semver (expected vMAJOR.MINOR.PATCH)"
+            }
+
+            $major = [int]$matches[1]
+            $minor = [int]$matches[2]
+            $patch = [int]$matches[3] + 1
+            $newTag = "v$major.$minor.$patch"
+          }
+
+          "tag=$newTag" >> $env:GITHUB_OUTPUT
+          "version=$($newTag.TrimStart('v'))" >> $env:GITHUB_OUTPUT
 
       - name: Restore dependencies
         run: dotnet restore --runtime win-x64
@@ -31,14 +59,20 @@ jobs:
         run: dotnet publish "lyrics overlay.csproj" --no-restore --configuration Release --runtime win-x64 --self-contained false --output ./publish
 
       - name: Zip artifact
-        run: Compress-Archive -Path ./publish/* -DestinationPath ./Spot-lyrics.zip
+        run: Compress-Archive -Path ./publish/* -DestinationPath ./Spot-lyrics-${{ steps.version.outputs.tag }}.zip
 
-      - name: Create or update GitHub Release
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      - name: Create tag
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.tag }}
+          git push origin ${{ steps.version.outputs.tag }}
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: Latest Build
-          body: "Automatically built from the latest commit on main."
-          prerelease: false
-          files: ./Spot-lyrics.zip
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: ./Spot-lyrics-${{ steps.version.outputs.tag }}.zip
