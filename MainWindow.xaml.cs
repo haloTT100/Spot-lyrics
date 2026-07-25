@@ -1619,6 +1619,4 @@ public sealed class SmtcPlaybackSource : IPlaybackSource
         byte[] bytes = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
         return Convert.ToHexString(bytes);
     }
-
-    
 }
