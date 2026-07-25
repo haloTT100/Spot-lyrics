@@ -447,7 +447,6 @@ public partial class MainWindow : Window
             catch (Exception ex)
             {
                 AppLogger.Log($"Polling exception: {ex}");
-                SetOverlayMessage(ex.Message);
             }
             finally
             {
