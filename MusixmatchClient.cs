@@ -128,26 +128,55 @@ private static bool ContainsJapanese(string text) =>
             return;
         }
 
+        await FetchTokenOnceAsync();
+
+        if (!string.IsNullOrWhiteSpace(UserToken))
+            return;
+
+        AppLogger.Log("Musixmatch token fetch returned empty token, retrying once after short delay");
+        await Task.Delay(600);
+        await FetchTokenOnceAsync();
+
+        if (string.IsNullOrWhiteSpace(UserToken))
+            throw new Exception("Musixmatch returned empty user_token after retry.");
+    }
+
+    private async Task FetchTokenOnceAsync()
+    {
         var url = $"{BaseUrl}token.get?app_id=mac-ios-v2.0";
         AppLogger.Log($"Musixmatch token URL: {url}");
 
-        using var doc = await GetJsonAsync(url);
+        try
+        {
+            using var doc = await GetJsonAsync(url);
 
-        var message = doc.RootElement.GetProperty("message");
-        var header = message.GetProperty("header");
-        int status = header.GetProperty("status_code").GetInt32();
-        AppLogger.Log($"Musixmatch token status_code={status}");
+            var message = doc.RootElement.GetProperty("message");
+            var header = message.GetProperty("header");
+            int status = header.GetProperty("status_code").GetInt32();
+            AppLogger.Log($"Musixmatch token status_code={status}");
 
-        if (status != 200)
+            if (status == 200)
+            {
+                var body = message.GetProperty("body");
+                UserToken = body.GetProperty("user_token").GetString() ?? "";
+                AppLogger.Log($"Musixmatch token length={UserToken.Length}");
+                return;
+            }
+
+            if (status == 401)
+            {
+                AppLogger.Log("Musixmatch token request returned 401, clearing token and retrying path");
+                UserToken = "";
+                return;
+            }
+
             throw new Exception($"Musixmatch token request failed: {status}");
-
-        var body = message.GetProperty("body");
-        UserToken = body.GetProperty("user_token").GetString() ?? "";
-
-        AppLogger.Log($"Musixmatch token length={UserToken.Length}");
-
-        if (string.IsNullOrWhiteSpace(UserToken))
-            throw new Exception("Musixmatch returned empty user_token.");
+        }
+        catch (HttpRequestException ex)
+        {
+            AppLogger.Log($"Musixmatch token HTTP exception: {ex.Message}");
+            UserToken = "";
+        }
     }
 
     public async Task<List<SyncedLyricLine>> GetSyncedLyricsAsync(
@@ -160,7 +189,15 @@ private static bool ContainsJapanese(string text) =>
         AppLogger.Log($"GetSyncedLyricsAsync begin | artist={artist} | title={title} | album={album} | spotifyUri={spotifyUri} | durationMs={durationMs}");
 
         LastKaraokeLines = new List<KaraokeLine>();
-        await EnsureTokenAsync();
+        try
+        {
+            await EnsureTokenAsync();
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log($"Musixmatch EnsureTokenAsync failed inside GetSyncedLyricsAsync: {ex.Message}");
+            return new List<SyncedLyricLine>();
+        }
 
         using var macroDoc = await GetMacroSubtitlesAsync(artist, title, album, spotifyUri, durationMs);
         var root = macroDoc.RootElement;

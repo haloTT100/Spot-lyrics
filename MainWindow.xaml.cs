@@ -19,6 +19,7 @@ using Drawing = System.Drawing;
 using WpfApp = System.Windows.Application;
 using System.Collections.ObjectModel;
 using Windows.Media.Control;
+using System.Windows.Controls;
 
 namespace lyrics_overlay;
 
@@ -29,6 +30,8 @@ public interface IPlaybackSource
     Task InitializeAsync();
     Task<SpotifyPlaybackState?> GetPlaybackAsync();
 }
+
+
 
 public partial class MainWindow : Window
 {
@@ -63,11 +66,13 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, List<SyncedLyricLine>> _lyricsCache = new();
     private readonly Dictionary<string, List<KaraokeLine>> _karaokeCache = new();
     private readonly HashSet<string> _noLyricsCache = new();
-
     private DispatcherTimer? _renderTimer;
     private int _baseProgressMs = 0;
     private DateTime _baseProgressUtc = DateTime.UtcNow;
     private bool _isPlaying = false;
+    private Window? _logWindow;
+    private System.Windows.Controls.TextBox? _logTextBox;
+    private System.Windows.Controls.TextBlock? _logStatusText;
 
     public ObservableCollection<DisplayLyricLine> VisibleLyrics { get; } = new();
 
@@ -193,8 +198,6 @@ public partial class MainWindow : Window
                 ApplyOverlayStyle();
                 await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
                 ApplyOverlayStyle();
-
-                await _musixmatch.EnsureTokenAsync();
 
                 _spotifySource = new SpotifyWebApiPlaybackSource();
                 _fallbackSource = new SmtcPlaybackSource();
@@ -741,6 +744,151 @@ public partial class MainWindow : Window
         });
     }
 
+    void ShowLogWindow()
+    {
+        if (_logWindow != null)
+        {
+            _logWindow.Show();
+            _logWindow.Activate();
+            RefreshLogWindow();
+            return;
+        }
+
+        var grid = new System.Windows.Controls.Grid();
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        _logStatusText = new System.Windows.Controls.TextBlock
+        {
+            Margin = new Thickness(10, 10, 10, 6)
+        };
+        Grid.SetRow(_logStatusText, 0);
+        grid.Children.Add(_logStatusText);
+
+        _logTextBox = new System.Windows.Controls.TextBox
+        {
+            Margin = new Thickness(10, 0, 10, 10),
+            IsReadOnly = true,
+            AcceptsReturn = true,
+            AcceptsTab = true,
+            VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
+            TextWrapping = TextWrapping.NoWrap,
+            FontFamily = new System.Windows.Media.FontFamily("Consolas")
+        };
+        Grid.SetRow(_logTextBox, 1);
+        grid.Children.Add(_logTextBox);
+
+        var buttons = new StackPanel
+        {
+            Orientation = System.Windows.Controls.Orientation.Horizontal,
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
+            Margin = new Thickness(10, 0, 10, 10)
+        };
+
+        var copyButton = new System.Windows.Controls.Button
+        {
+            Content = "Copy",
+            Margin = new Thickness(0, 0, 8, 0),
+            Padding = new Thickness(12, 4, 12, 4)
+        };
+        copyButton.Click += (_, __) =>
+        {
+            if (_logTextBox == null)
+                return;
+
+            string textToCopy = !string.IsNullOrEmpty(_logTextBox.SelectedText)
+                ? _logTextBox.SelectedText
+                : _logTextBox.Text;
+
+            if (!string.IsNullOrEmpty(textToCopy))
+                System.Windows.Clipboard.SetText(textToCopy);
+        };
+
+        var clearButton = new System.Windows.Controls.Button
+        {
+            Content = "Clear",
+            Margin = new Thickness(0, 0, 8, 0),
+            Padding = new Thickness(12, 4, 12, 4)
+        };
+        clearButton.Click += (_, __) => AppLogger.Clear();
+
+        var pauseButton = new System.Windows.Controls.Button
+        {
+            Content = AppLogger.IsMemoryLoggingPaused ? "Resume Logging" : "Pause Logging",
+            Margin = new Thickness(0, 0, 8, 0),
+            Padding = new Thickness(12, 4, 12, 4)
+        };
+
+        pauseButton.Click += (_, __) =>
+        {
+            bool newPaused = !AppLogger.IsMemoryLoggingPaused;
+            AppLogger.SetMemoryLoggingPaused(newPaused);
+            pauseButton.Content = newPaused ? "Resume Logging" : "Pause Logging";
+        };
+
+        var closeButton = new System.Windows.Controls.Button
+        {
+            Content = "Close",
+            Padding = new Thickness(12, 4, 12, 4)
+        };
+        closeButton.Click += (_, __) => _logWindow?.Hide();
+
+        buttons.Children.Add(copyButton);
+        buttons.Children.Add(pauseButton);
+        buttons.Children.Add(clearButton);
+        buttons.Children.Add(closeButton);
+
+        Grid.SetRow(buttons, 2);
+        grid.Children.Add(buttons);
+
+        _logWindow = new Window
+        {
+            Title = "Active Log",
+            Width = 900,
+            Height = 500,
+            Content = grid,
+            Owner = this
+        };
+
+        _logWindow.Closed += (_, __) =>
+        {
+            AppLogger.LogChanged -= RefreshLogWindow;
+            _logWindow = null;
+            _logTextBox = null;
+            _logStatusText = null;
+        };
+
+        _logWindow.IsVisibleChanged += (_, __) =>
+        {
+            if (_logWindow?.IsVisible == true)
+                RefreshLogWindow();
+        };
+
+        AppLogger.LogChanged += RefreshLogWindow;
+
+        RefreshLogWindow();
+        _logWindow.Show();
+    }
+
+    void RefreshLogWindow()
+    {
+        Dispatcher.Invoke(() =>
+        {
+            if (_logWindow?.IsVisible != true || _logTextBox == null || _logStatusText == null)
+                return;
+
+            _logTextBox.Text = AppLogger.GetLogText();
+            _logTextBox.CaretIndex = _logTextBox.Text.Length;
+            _logTextBox.ScrollToEnd();
+
+            double mib = AppLogger.GetStoredBytes() / 1024.0 / 1024.0;
+            string state = AppLogger.IsMemoryLoggingPaused ? "Paused" : "Recording";
+            _logStatusText.Text = $"State: {state} | Entries: {AppLogger.GetEntryCount()} | Memory: {mib:F2} MiB / 1.00 MiB";
+        });
+    }
+
     void SetupTrayIcon()
     {
         AppLogger.Log("SetupTrayIcon begin");
@@ -764,6 +912,18 @@ public partial class MainWindow : Window
         {
             AppLogger.Log("Tray menu: Hide clicked");
             Hide();
+        });
+
+        menu.Items.Add("View Log", null, (_, __) =>
+        {
+            AppLogger.Log("Tray menu: View Log clicked");
+            ShowLogWindow();
+        });
+
+        menu.Items.Add("Clear Log", null, (_, __) =>
+        {
+            AppLogger.Log("Tray menu: Clear Log clicked");
+            AppLogger.Clear();
         });
 
         menu.Items.Add(new Forms.ToolStripSeparator());
@@ -804,6 +964,7 @@ public partial class MainWindow : Window
             _textOnlyMode = textOnlyItem.Checked;
             AppLogger.Log($"Tray menu: TextOnlyMode changed to {_textOnlyMode}");
             ApplyOverlayStyle();
+            SaveWindowSettings();
         };
         menu.Items.Add(textOnlyItem);
 
@@ -942,6 +1103,7 @@ public partial class MainWindow : Window
             Height = IsValidWindowNumber(settings.Height) && settings.Height > 0 ? settings.Height : 220;
             Left = IsValidWindowNumber(settings.Left) ? settings.Left : (SystemParameters.PrimaryScreenWidth - Width) / 2;
             Top = IsValidWindowNumber(settings.Top) ? settings.Top : (SystemParameters.PrimaryScreenHeight - Height - 120);
+            _textOnlyMode = settings.TextOnlyMode;
 
             AppLogger.Log($"Loaded window settings | Left={Left} | Top={Top} | Width={Width} | Height={Height}");
         }
@@ -983,7 +1145,7 @@ public partial class MainWindow : Window
             });
 
             System.IO.File.WriteAllText(_windowSettingsPath, json);
-            AppLogger.Log($"Saved window settings | Left={settings.Left} | Top={settings.Top} | Width={settings.Width} | Height={settings.Height}");
+            AppLogger.Log($"Saved window settings | Left={settings.Left} | Top={settings.Top} | Width={settings.Width} | Height={settings.Height} | TextOnlyMode={settings.TextOnlyMode}");
         }
         catch (Exception ex)
         {
@@ -1020,7 +1182,8 @@ public partial class MainWindow : Window
             Left = left,
             Top = top,
             Width = width,
-            Height = height
+            Height = height,
+            TextOnlyMode = _textOnlyMode
         };
 
         return true;
@@ -1034,9 +1197,120 @@ public partial class MainWindow : Window
 
 public static class AppLogger
 {
+    private sealed class LogEntry
+    {
+        public string Text { get; init; } = "";
+        public int SizeBytes { get; init; }
+    }
+
+    private static readonly object _sync = new();
+    private static readonly Queue<LogEntry> _entries = new();
+    private static int _totalBytes;
+
+    private const int MaxBytes = 1024 * 1024;
+
+    public static event Action? LogChanged;
+
+    public static bool IsMemoryLoggingPaused
+    {
+        get
+        {
+            lock (_sync)
+                return _isMemoryLoggingPaused;
+        }
+    }
+
+    private static bool _isMemoryLoggingPaused;
+
     public static void Log(string message)
     {
-        Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+        string line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+
+        Debug.WriteLine(line);
+
+        bool changed = false;
+
+        lock (_sync)
+        {
+            if (!_isMemoryLoggingPaused)
+            {
+                int sizeBytes = Encoding.Unicode.GetByteCount(line) + sizeof(char) * Environment.NewLine.Length;
+
+                _entries.Enqueue(new LogEntry
+                {
+                    Text = line,
+                    SizeBytes = sizeBytes
+                });
+
+                _totalBytes += sizeBytes;
+
+                while (_totalBytes > MaxBytes && _entries.Count > 0)
+                {
+                    var removed = _entries.Dequeue();
+                    _totalBytes -= removed.SizeBytes;
+                }
+
+                changed = true;
+            }
+        }
+
+        if (changed)
+            LogChanged?.Invoke();
+    }
+
+    public static string GetLogText()
+    {
+        lock (_sync)
+        {
+            if (_entries.Count == 0)
+                return "";
+
+            var sb = new StringBuilder();
+            foreach (var entry in _entries)
+                sb.AppendLine(entry.Text);
+
+            return sb.ToString();
+        }
+    }
+
+    public static int GetStoredBytes()
+    {
+        lock (_sync)
+            return _totalBytes;
+    }
+
+    public static int GetEntryCount()
+    {
+        lock (_sync)
+            return _entries.Count;
+    }
+
+    public static void Clear()
+    {
+        lock (_sync)
+        {
+            _entries.Clear();
+            _totalBytes = 0;
+        }
+
+        LogChanged?.Invoke();
+    }
+
+    public static void SetMemoryLoggingPaused(bool paused)
+    {
+        bool changed;
+
+        lock (_sync)
+        {
+            changed = _isMemoryLoggingPaused != paused;
+            _isMemoryLoggingPaused = paused;
+        }
+
+        if (changed)
+        {
+            Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Memory logging paused={paused}");
+            LogChanged?.Invoke();
+        }
     }
 }
 
@@ -1046,6 +1320,7 @@ public class WindowSettings
     public double Top { get; set; }
     public double Width { get; set; }
     public double Height { get; set; }
+    public bool TextOnlyMode { get; set; } = true;
 }
 
 public class DisplayLyricLine
@@ -1620,5 +1895,5 @@ public sealed class SmtcPlaybackSource : IPlaybackSource
         return Convert.ToHexString(bytes);
     }
 
-    
+
 }
