@@ -4,6 +4,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:lyrics_overlay"
         Title="Lyrics Overlay"
+        Icon="Assets/AppIcon.ico"
         Width="900"
         Height="220"
         WindowStyle="None"

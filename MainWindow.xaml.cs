@@ -134,6 +134,18 @@ public partial class MainWindow : Window
         return -(Math.Cos(Math.PI * t) - 1.0) / 2.0;
     }
 
+    private static Drawing.Icon LoadTrayIcon()
+    {
+        var uri = new Uri("pack://application:,,,/Assets/AppIcon.ico", UriKind.Absolute);
+        var resourceStream = System.Windows.Application.GetResourceStream(uri);
+
+        if (resourceStream == null)
+            throw new InvalidOperationException("Could not load tray icon resource: Assets/AppIcon.ico");
+
+        using var stream = resourceStream.Stream;
+        return new Drawing.Icon(stream);
+    }
+
     public MainWindow()
     {
         InitializeComponent();
@@ -888,16 +900,15 @@ public partial class MainWindow : Window
             _logStatusText.Text = $"State: {state} | Entries: {AppLogger.GetEntryCount()} | Memory: {mib:F2} MiB / 1.00 MiB";
         });
     }
-
     void SetupTrayIcon()
     {
         AppLogger.Log("SetupTrayIcon begin");
 
         _trayIcon = new Forms.NotifyIcon
         {
-            Icon = Drawing.SystemIcons.Application,
+            Icon = LoadTrayIcon(),
             Visible = true,
-            Text = "Lyrics Overlay"
+            Text = "Spot Lyrics"
         };
 
         var menu = new Forms.ContextMenuStrip();
@@ -1894,6 +1905,4 @@ public sealed class SmtcPlaybackSource : IPlaybackSource
         byte[] bytes = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
         return Convert.ToHexString(bytes);
     }
-
-
 }
