@@ -31,6 +31,37 @@ public interface IPlaybackSource
     Task<SpotifyPlaybackState?> GetPlaybackAsync();
 }
 
+public class NullOrEmptyToVisibilityConverter : IValueConverter
+{
+    public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+    {
+        return string.IsNullOrWhiteSpace(value as string)
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+    }
+
+    public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        => throw new NotImplementedException();
+}
+public class SecondaryLineFontSizeConverter : IValueConverter
+{
+    public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+    {
+        int d = value is int i ? i : 0;
+
+        if (d < 0)
+            return 16.0;
+
+        if (d == 0)
+            return 22.0;
+
+        return 16.0;
+    }
+
+    public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        => throw new NotImplementedException();
+}
+
 
 
 public partial class MainWindow : Window
@@ -61,6 +92,7 @@ public partial class MainWindow : Window
     private string _lastKaraokeRenderKey = "";
     private string _currentTrackId = "";
     private string _lastDisplayedText = "";
+    private bool showRomanizedText = true;
     private bool _pollInProgress = false;
     private bool _currentTrackHasNoLyrics = false;
     private readonly Dictionary<string, List<SyncedLyricLine>> _lyricsCache = new();
@@ -120,12 +152,6 @@ public partial class MainWindow : Window
         byte b = (byte)Math.Round(from.B + ((to.B - from.B) * t));
 
         return System.Windows.Media.Color.FromArgb(a, r, g, b);
-    }
-
-    static double EaseOutCubic(double t)
-    {
-        t = Math.Max(0.0, Math.Min(1.0, t));
-        return 1.0 - Math.Pow(1.0 - t, 3.0);
     }
 
     static double EaseInOutSine(double t)
@@ -434,6 +460,26 @@ public partial class MainWindow : Window
         AppLogger.Log("Spotify polling timer started");
     }
 
+    private static bool HasRealRomanizedText(string original, string? romanized)
+    {
+        if (string.IsNullOrWhiteSpace(original) || string.IsNullOrWhiteSpace(romanized))
+            return false;
+
+        static string Normalize(string s)
+        {
+            return string.Concat(
+                s.Trim()
+                .Normalize(NormalizationForm.FormKC)
+                .Where(ch => !char.IsControl(ch)))
+                .Replace("’", "'")
+                .Replace("`", "'")
+                .Replace("“", "\"")
+                .Replace("”", "\"");
+        }
+
+        return !string.Equals(Normalize(original), Normalize(romanized), StringComparison.OrdinalIgnoreCase);
+    }
+
     static List<KaraokeLine> CloneKaraokeLines(IEnumerable<KaraokeLine>? source)
     {
         if (source == null)
@@ -444,43 +490,58 @@ public partial class MainWindow : Window
             StartTimeMs = line.StartTimeMs,
             EndTimeMs = line.EndTimeMs,
             Performer = line.Performer,
-            Words = (line.Words ?? new List<KaraokeWord>()).Select(word => new KaraokeWord
-            {
-                Word = word.Word,
-                OffsetMs = word.OffsetMs,
-                DurationMs = word.DurationMs
-            }).ToList()
+            Words = (line.Words ?? new List<KaraokeWord>())
+                .Select(word => new KaraokeWord
+                {
+                    Word = word.Word,
+                    OriginalWord = word.OriginalWord,
+                    RomanizedWord = word.RomanizedWord,
+                    OffsetMs = word.OffsetMs,
+                    DurationMs = word.DurationMs
+                })
+                .ToList()
         }).ToList();
     }
 
     void UpdateLyricFromMilliseconds(int progressMs)
     {
-        if ((_syncedLyrics == null || _syncedLyrics.Count == 0) && (_karaokeLyrics == null || _karaokeLyrics.Count == 0))
+        if (_syncedLyrics == null || _syncedLyrics.Count == 0)
             return;
 
         _lastProgressMs = progressMs;
         RefreshVisibleLyrics(progressMs);
     }
 
+    private static bool HasMeaningfulKaraoke(KaraokeLine? line)
+    {
+        if (line == null || line.Words == null || line.Words.Count == 0)
+            return false;
+
+        return line.Words.Any(w => !string.IsNullOrWhiteSpace(w.Word));
+    }
+
+    private bool ShouldUseKaraokeRendering()
+    {
+        if (_karaokeLyrics == null || _karaokeLyrics.Count == 0)
+            return false;
+
+        return _karaokeLyrics.Any(HasMeaningfulKaraoke);
+    }
+
     void RefreshVisibleLyrics(int? progressOverrideMs = null)
     {
-        if ((_syncedLyrics == null || _syncedLyrics.Count == 0) &&
-            (_karaokeLyrics == null || _karaokeLyrics.Count == 0))
+        if (_syncedLyrics == null || _syncedLyrics.Count == 0)
             return;
 
         int progressMs = progressOverrideMs ?? _lastProgressMs;
 
-        if (_karaokeLyrics != null && _karaokeLyrics.Count > 0)
+        if (ShouldUseKaraokeRendering())
         {
             RefreshVisibleKaraokeLyrics(progressMs);
             return;
         }
 
-        if (_syncedLyrics == null || _syncedLyrics.Count == 0)
-            return;
-
         int currentIndex = 0;
-
         for (int i = 0; i < _syncedLyrics.Count; i++)
         {
             var lyric = _syncedLyrics[i];
@@ -493,15 +554,17 @@ public partial class MainWindow : Window
         var (start, end, previousLinesToShow) = CalculateVisibleRange(currentIndex, _syncedLyrics.Count);
 
         var lines = new List<DisplayLyricLine>();
-
         for (int i = start; i <= end; i++)
         {
-            var lyric = _syncedLyrics[i];
-            var text = string.IsNullOrWhiteSpace(lyric?.Text) ? " " : lyric!.Text;
+            var line = _syncedLyrics[i];
+            bool hasRomanized =
+                showRomanizedText &&
+                HasRealRomanizedText(line.OriginalText ?? line.Text, line.RomanizedText);
 
             lines.Add(new DisplayLyricLine
             {
-                Text = text,
+                Text = hasRomanized ? (line.OriginalText ?? line.Text) : (line.RomanizedText ?? line.Text),
+                SecondaryText = hasRomanized ? line.RomanizedText : null,
                 DistanceFromCurrent = i - currentIndex,
                 IsKaraokeLine = false,
                 Segments = new List<DisplayKaraokeSegment>()
@@ -509,12 +572,12 @@ public partial class MainWindow : Window
         }
 
         var currentLyric = _syncedLyrics[currentIndex];
-        var currentText = string.IsNullOrWhiteSpace(currentLyric?.Text) ? " " : currentLyric!.Text;
+        var currentText = string.IsNullOrWhiteSpace(currentLyric?.Text) ? "" : currentLyric.Text;
 
         if (!string.Equals(currentText, _lastDisplayedText, StringComparison.Ordinal))
         {
             _lastDisplayedText = currentText;
-            AppLogger.Log($"Displaying lyric currentIndex={currentIndex}, previousLines={previousLinesToShow}, nextLines={end - currentIndex}, current='{_lastDisplayedText}'");
+            AppLogger.Log($"Displaying lyric currentIndex={currentIndex}, previousLines={previousLinesToShow}, nextLines={end - currentIndex}, current={_lastDisplayedText}");
         }
 
         ReplaceVisibleLyrics(lines);
@@ -543,18 +606,28 @@ public partial class MainWindow : Window
         {
             var line = _karaokeLyrics[i];
 
+            string originalText = string.IsNullOrWhiteSpace(line.OriginalFullText) ? "" : line.OriginalFullText;
+            string romanizedText = string.IsNullOrWhiteSpace(line.RomanizedFullText) ? "" : line.RomanizedFullText;
+
+            bool hasRomanized =
+                showRomanizedText &&
+                !string.IsNullOrWhiteSpace(originalText) &&
+                !string.IsNullOrWhiteSpace(romanizedText) &&
+                !string.Equals(originalText, romanizedText, StringComparison.Ordinal);
+
             lines.Add(new DisplayLyricLine
             {
-                Text = string.IsNullOrWhiteSpace(line.FullText) ? " " : line.FullText,
+                Text = hasRomanized ? originalText : "",
+                SecondaryText = hasRomanized ? romanizedText : null,
                 DistanceFromCurrent = i - currentIndex,
                 IsKaraokeLine = true,
                 Segments = BuildKaraokeSegments(line, progressMs)
             });
         }
 
-        string currentDisplay = string.IsNullOrWhiteSpace(_karaokeLyrics[currentIndex].FullText)
-            ? " "
-            : _karaokeLyrics[currentIndex].FullText;
+        string currentDisplay = string.IsNullOrWhiteSpace(_karaokeLyrics[currentIndex].RomanizedFullText)
+            ? ""
+            : _karaokeLyrics[currentIndex].RomanizedFullText;
 
         if (!string.Equals(currentDisplay, _lastDisplayedText, StringComparison.Ordinal))
         {
@@ -594,7 +667,7 @@ public partial class MainWindow : Window
         {
             segments.Add(new DisplayKaraokeSegment
             {
-                Text = " ",
+                Text = "",
                 ForegroundBrush = UpcomingWordBrush
             });
             return segments;
@@ -603,7 +676,7 @@ public partial class MainWindow : Window
         for (int i = 0; i < line.Words.Count; i++)
         {
             var word = line.Words[i];
-            string text = word.Word ?? "";
+            string text = word.RomanizedWord ?? word.Word ?? "";
 
             if (string.IsNullOrEmpty(text))
                 continue;
@@ -612,38 +685,24 @@ public partial class MainWindow : Window
 
             int wordEndMs;
             if (word.DurationMs > 0)
-            {
                 wordEndMs = wordStartMs + word.DurationMs;
-            }
             else if (i + 1 < line.Words.Count)
-            {
                 wordEndMs = line.StartTimeMs + line.Words[i + 1].OffsetMs;
-            }
             else
-            {
                 wordEndMs = line.EndTimeMs > wordStartMs ? line.EndTimeMs : wordStartMs + 900;
-            }
 
             if (wordEndMs <= wordStartMs)
                 wordEndMs = wordStartMs + 120;
 
             if (progressMs < wordStartMs)
             {
-                segments.Add(new DisplayKaraokeSegment
-                {
-                    Text = text,
-                    ForegroundBrush = UpcomingWordBrush
-                });
+                segments.Add(new DisplayKaraokeSegment { Text = text, ForegroundBrush = UpcomingWordBrush });
                 continue;
             }
 
             if (progressMs >= wordEndMs)
             {
-                segments.Add(new DisplayKaraokeSegment
-                {
-                    Text = text,
-                    ForegroundBrush = SungWordBrush
-                });
+                segments.Add(new DisplayKaraokeSegment { Text = text, ForegroundBrush = SungWordBrush });
                 continue;
             }
 
@@ -979,6 +1038,21 @@ public partial class MainWindow : Window
         };
         menu.Items.Add(textOnlyItem);
 
+        var romanizedItem = new Forms.ToolStripMenuItem("Always show original text")
+        {
+            CheckOnClick = true,
+            Checked = showRomanizedText
+        };
+
+        romanizedItem.CheckedChanged += (_, __) =>
+        {
+            showRomanizedText = romanizedItem.Checked;
+            AppLogger.Log($"Tray menu Always show original text changed to {showRomanizedText}");
+            RefreshVisibleLyrics(_lastProgressMs);
+            SaveWindowSettings();
+        };
+        menu.Items.Add(romanizedItem);
+
         menu.Items.Add(new Forms.ToolStripSeparator());
 
         menu.Items.Add("Exit", null, (_, __) =>
@@ -1115,8 +1189,9 @@ public partial class MainWindow : Window
             Left = IsValidWindowNumber(settings.Left) ? settings.Left : (SystemParameters.PrimaryScreenWidth - Width) / 2;
             Top = IsValidWindowNumber(settings.Top) ? settings.Top : (SystemParameters.PrimaryScreenHeight - Height - 120);
             _textOnlyMode = settings.TextOnlyMode;
+            showRomanizedText = settings.ShowRomanizedText;
 
-            AppLogger.Log($"Loaded window settings | Left={Left} | Top={Top} | Width={Width} | Height={Height}");
+            AppLogger.Log($"Loaded window settings Left={Left} Top={Top} Width={Width} Height={Height} TextOnlyMode={_textOnlyMode} ShowRomanizedText={showRomanizedText}");
         }
         catch (Exception ex)
         {
@@ -1173,18 +1248,15 @@ public partial class MainWindow : Window
         double width = Width;
         double height = Height;
 
-        if (!IsValidWindowNumber(left) ||
-            !IsValidWindowNumber(top) ||
-            !IsValidWindowNumber(width) ||
-            !IsValidWindowNumber(height))
+        if (!IsValidWindowNumber(left) || !IsValidWindowNumber(top) || !IsValidWindowNumber(width) || !IsValidWindowNumber(height))
         {
-            AppLogger.Log($"Skipping SaveWindowSettings due to invalid values | Left={left} | Top={top} | Width={width} | Height={height}");
+            AppLogger.Log($"Skipping SaveWindowSettings due to invalid values Left={left} Top={top} Width={width} Height={height}");
             return false;
         }
 
         if (width <= 0 || height <= 0)
         {
-            AppLogger.Log($"Skipping SaveWindowSettings due to non-positive size | Width={width} | Height={height}");
+            AppLogger.Log($"Skipping SaveWindowSettings due to non-positive size Width={width} Height={height}");
             return false;
         }
 
@@ -1194,7 +1266,8 @@ public partial class MainWindow : Window
             Top = top,
             Width = width,
             Height = height,
-            TextOnlyMode = _textOnlyMode
+            TextOnlyMode = _textOnlyMode,
+            ShowRomanizedText = showRomanizedText
         };
 
         return true;
@@ -1332,11 +1405,13 @@ public class WindowSettings
     public double Width { get; set; }
     public double Height { get; set; }
     public bool TextOnlyMode { get; set; } = true;
+    public bool ShowRomanizedText { get; set; } = true;
 }
 
 public class DisplayLyricLine
 {
     public string Text { get; set; } = "";
+    public string? SecondaryText { get; set; }
     public int DistanceFromCurrent { get; set; }
     public bool IsKaraokeLine { get; set; }
     public List<DisplayKaraokeSegment> Segments { get; set; } = new();

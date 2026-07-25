@@ -23,13 +23,16 @@ public class MusixmatchClient
     public List<KaraokeLine> LastKaraokeLines { get; private set; } = new();
     public bool RomanizeLyrics { get; set; } = true;
 
-    private async Task<string> TransformLyricTextAsync(string text)
+    private async Task<(string original, string display)> TransformLyricTextAsync(string text)
     {
-        if (string.IsNullOrWhiteSpace(text) || !RomanizeLyrics)
-            return text;
+        if (string.IsNullOrWhiteSpace(text))
+            return (text, text);
+
+        if (!RomanizeLyrics)
+            return (text, text);
 
         if (_romanizeCache.TryGetValue(text, out var cached))
-            return cached;
+            return (text, cached);
 
         string transformed = text;
 
@@ -58,7 +61,7 @@ public class MusixmatchClient
 
         transformed = string.IsNullOrWhiteSpace(transformed) ? text : transformed;
         _romanizeCache[text] = transformed;
-        return transformed;
+        return (text, transformed);
     }
 
 private static bool ContainsCyrillic(string text) =>
@@ -402,10 +405,15 @@ private static bool ContainsJapanese(string text) =>
                     if (wordEl.ValueKind != JsonValueKind.Object)
                         continue;
 
-                    string wordText =
-                        wordEl.TryGetProperty("c", out var cEl) && cEl.ValueKind == JsonValueKind.String
-                            ? await TransformLyricTextAsync(cEl.GetString() ?? "")
-                            : "";
+                    string originalWord = "";
+                    string romanizedWord = "";
+
+                    if (wordEl.TryGetProperty("c", out var cEl) && cEl.ValueKind == JsonValueKind.String)
+                    {
+                        var transformed = await TransformLyricTextAsync(cEl.GetString() ?? "");
+                        originalWord = transformed.original;
+                        romanizedWord = transformed.display;
+                    }
 
                     double wordOffsetSec =
                         wordEl.TryGetProperty("o", out var oEl) && oEl.ValueKind == JsonValueKind.Number
@@ -438,7 +446,9 @@ private static bool ContainsJapanese(string text) =>
 
                     karaokeLine.Words.Add(new KaraokeWord
                     {
-                        Word = wordText,
+                        Word = romanizedWord,
+                        OriginalWord = originalWord,
+                        RomanizedWord = romanizedWord,
                         OffsetMs = offsetMs,
                         DurationMs = Math.Max(0, durationMs)
                     });
@@ -534,12 +544,21 @@ private static bool ContainsJapanese(string text) =>
         foreach (var line in subtitleDoc.RootElement.EnumerateArray())
         {
             string text = "♪";
+            string? originalText = null;
+            string? romanizedText = null;
             int startMs = 0;
 
             if (line.ValueKind == JsonValueKind.Object)
             {
                 if (line.TryGetProperty("text", out var textEl) && textEl.ValueKind == JsonValueKind.String)
-                    text = await TransformLyricTextAsync(textEl.GetString() ?? "♪");
+                {
+                    var raw = textEl.GetString() ?? "♪";
+                    var transformed = await TransformLyricTextAsync(raw);
+
+                    originalText = transformed.original;
+                    romanizedText = transformed.display;
+                    text = transformed.display;
+                }
 
                 if (line.TryGetProperty("time", out var timeEl) &&
                     timeEl.ValueKind == JsonValueKind.Object &&
@@ -553,6 +572,8 @@ private static bool ContainsJapanese(string text) =>
             result.Add(new SyncedLyricLine
             {
                 Text = string.IsNullOrWhiteSpace(text) ? "♪" : text,
+                OriginalText = originalText,
+                RomanizedText = romanizedText,
                 StartTimeMs = startMs
             });
         }
@@ -620,9 +641,13 @@ private static bool ContainsJapanese(string text) =>
 
         for (int i = 0; i < rawLines.Length; i++)
         {
+            var transformed = await TransformLyricTextAsync(rawLines[i]);
+
             result.Add(new SyncedLyricLine
             {
-                Text = await TransformLyricTextAsync(rawLines[i]),
+                Text = transformed.display,
+                OriginalText = transformed.original,
+                RomanizedText = transformed.display,
                 StartTimeMs = i * 4000
             });
         }
@@ -670,6 +695,8 @@ private static bool ContainsJapanese(string text) =>
 public class SyncedLyricLine
 {
     public string Text { get; set; } = "";
+    public string? OriginalText { get; set; }
+    public string? RomanizedText { get; set; }
     public int StartTimeMs { get; set; }
     public string? Performer { get; set; }
 }
@@ -677,6 +704,8 @@ public class SyncedLyricLine
 public class KaraokeWord
 {
     public string Word { get; set; } = "";
+    public string? OriginalWord { get; set; }
+    public string? RomanizedWord { get; set; }
     public int OffsetMs { get; set; }
     public int DurationMs { get; set; }
 }
@@ -688,5 +717,7 @@ public class KaraokeLine
     public string? Performer { get; set; }
     public List<KaraokeWord> Words { get; set; } = new();
 
-    public string FullText => string.Concat(Words.Select(w => w.Word));
+    public string FullText => string.Concat(Words.Select(w => w.RomanizedWord ?? w.Word ?? ""));
+    public string OriginalFullText => string.Concat(Words.Select(w => w.OriginalWord ?? w.Word ?? ""));
+    public string RomanizedFullText => string.Concat(Words.Select(w => w.RomanizedWord ?? w.Word ?? ""));
 }
