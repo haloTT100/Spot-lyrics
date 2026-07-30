@@ -214,6 +214,7 @@ public partial class MainWindow : Window
 
                 StartSpotifyPolling();
                 StartRenderTimer();
+                RuntimeProfiler.Start();
 
                 var state = _playbackSource != null
                     ? await _playbackSource.GetPlaybackAsync()
@@ -248,9 +249,9 @@ public partial class MainWindow : Window
     {
         _renderTimer = new DispatcherTimer
         {
-            // Thirty FPS is smooth for lyric highlighting while avoiding the
-            // short-lived UI objects and brushes created at 60 FPS.
-            Interval = TimeSpan.FromMilliseconds(33)
+            // Rebuilding WPF lyric visuals is allocation-heavy. Ten FPS keeps
+            // word highlighting responsive while greatly reducing UI churn.
+            Interval = TimeSpan.FromMilliseconds(100)
         };
 
         _renderTimer.Tick += (_, __) =>
@@ -646,8 +647,27 @@ public partial class MainWindow : Window
 
     void ReplaceVisibleLyrics(IEnumerable<DisplayLyricLine> lines)
     {
+        var nextLines = lines.ToList();
+
+        // Karaoke refreshes change word colouring far more often than they
+        // change the visible lyric lines. Reusing the existing line containers
+        // prevents WPF from rebuilding their outer visual tree every frame.
+        if (VisibleLyrics.Count == nextLines.Count &&
+            VisibleLyrics.Zip(nextLines, (current, next) =>
+                current.DistanceFromCurrent == next.DistanceFromCurrent &&
+                current.IsKaraokeLine == next.IsKaraokeLine &&
+                string.Equals(current.Text, next.Text, StringComparison.Ordinal) &&
+                string.Equals(current.SecondaryText, next.SecondaryText, StringComparison.Ordinal))
+                .All(isSameLine => isSameLine))
+        {
+            for (int index = 0; index < nextLines.Count; index++)
+                VisibleLyrics[index].Segments = nextLines[index].Segments;
+
+            return;
+        }
+
         VisibleLyrics.Clear();
-        foreach (var line in lines)
+        foreach (var line in nextLines)
             VisibleLyrics.Add(line);
     }
 
@@ -712,6 +732,12 @@ public partial class MainWindow : Window
         {
             AppLogger.Log("Tray menu: Clear Log clicked");
             AppLogger.Clear();
+        });
+
+        menu.Items.Add("Log Memory Profile", null, (_, __) =>
+        {
+            RuntimeProfiler.LogReport();
+            ShowLogWindow();
         });
 
         menu.Items.Add(new Forms.ToolStripSeparator());
@@ -817,6 +843,7 @@ public partial class MainWindow : Window
         AppLogger.Log("ExitApplication begin");
         _isRealExit = true;
         SaveWindowSettings();
+        RuntimeProfiler.Stop();
 
         if (_trayIcon != null)
         {
@@ -1099,13 +1126,25 @@ public class WindowSettings
     public bool ShowRomanizedText { get; set; } = true;
 }
 
-public class DisplayLyricLine
+public class DisplayLyricLine : INotifyPropertyChanged
 {
+    private List<DisplayKaraokeSegment> _segments = new();
+
     public string Text { get; set; } = "";
     public string? SecondaryText { get; set; }
     public int DistanceFromCurrent { get; set; }
     public bool IsKaraokeLine { get; set; }
-    public List<DisplayKaraokeSegment> Segments { get; set; } = new();
+    public List<DisplayKaraokeSegment> Segments
+    {
+        get => _segments;
+        set
+        {
+            _segments = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Segments)));
+        }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
 }
 
 public class DisplayKaraokeSegment
