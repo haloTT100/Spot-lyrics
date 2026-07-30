@@ -13,6 +13,7 @@ It tracks the current song from Spotify, fetches synced lyrics, and renders them
 - Tray icon controls for show/hide, drag, resize, and text-only mode
 - Window position and size persistence
 - Romanization support for Japanese and Cyrillic lyrics
+- Built-in runtime memory profiler available from the tray menu
 
 ## How it works
 
@@ -25,9 +26,24 @@ Spot-lyrics separates playback detection from lyric rendering:
   - Musixmatch for synced, unsynced, and karaoke-capable lyrics
 - **Rendering layer**
   - WPF overlay with an `ObservableCollection`-based display pipeline
-  - Segment merging and render-key checks to reduce flicker
+  - Reused lyric-line containers, cached karaoke brushes, and throttled karaoke updates to reduce WPF allocation churn
+- **Diagnostics layer**
+  - A fixed-size runtime sampler for memory, GC, allocation rate, handles, and thread counts
 
 This keeps the overlay responsive while preserving smooth karaoke transitions.
+
+## Performance and memory
+
+The app avoids loading the Kawazu/MeCab Japanese dictionary until Japanese lyrics actually require romanization. It also bounds lyric and romanization caches, reuses the Spotify HTTP client, and limits karaoke refreshes to reduce short-lived WPF allocations.
+
+To inspect runtime memory, open the tray menu and select **Log Memory Profile**. The report is shown in the active log and includes:
+
+- Working set and private memory
+- Managed live memory, GC heap size, and fragmentation
+- Managed allocation rate and memory growth since profiling began
+- Handle, thread, and GC collection counts
+
+The profiler samples once every 10 seconds and stores only the latest 60 samples.
 
 ## Tech stack
 
@@ -92,18 +108,26 @@ If Spotify playback is not available, the app can fall back to SMTC session data
   - Enable dragging
   - Enable resizing
   - Toggle text-only mode
+  - Open the active log or write a memory-profile report to it
   - Exit the app
 
 ## Notes
 
 - Not every track has synced or karaoke lyrics available
 - Playback metadata quality may differ between Spotify Web API and SMTC fallback
-- The overlay is optimized to preserve smooth karaoke rendering without constant UI replacement
+- Japanese romanization loads its dictionary only when it is needed; the first Japanese track may therefore take slightly longer to prepare
 - Some lyric sources and APIs may change behavior over time
 
 ## Project structure
 
-Typical core pieces include:
+The main implementation is organized into these focused components:
+
+- `KaraokeSegmentRenderer.cs` — timed karaoke word colouring and segment generation
+- `WindowSettingsStore.cs` — saved overlay layout and preference persistence
+- `LogViewerWindow.cs` — active-log window with throttled refreshes
+- `RuntimeProfiler.cs` — lightweight runtime memory and allocation sampling
+
+The remaining core pieces include:
 
 - `MainWindow.xaml` — overlay UI
 - `MainWindow.xaml.cs` — playback polling, overlay state, lyric rendering pipeline
