@@ -16,8 +16,12 @@ public class MusixmatchClient
     private const string BaseUrl = "https://apic-appmobile.musixmatch.com/ws/1.1/";
     private readonly HttpClient _http = new();
 
-    private readonly KawazuConverter _kawazu;
+    // Loading the MeCab dictionary is expensive, so defer it until Japanese
+    // lyrics actually need romanization.
+    private KawazuConverter? _kawazu;
+    private readonly string _ipaDicPath;
     private readonly Dictionary<string, string> _romanizeCache = new(StringComparer.Ordinal);
+    private const int MaxRomanizeCacheEntries = 4_000;
 
     public string UserToken { get; private set; } = "";
     public List<KaraokeLine> LastKaraokeLines { get; private set; } = new();
@@ -40,7 +44,7 @@ public class MusixmatchClient
         {
             if (ContainsJapanese(text))
             {
-                transformed = await _kawazu.Convert(
+                transformed = await GetKawazuConverter().Convert(
                     text,
                     To.Romaji,
                     Mode.Spaced,
@@ -60,6 +64,9 @@ public class MusixmatchClient
         }
 
         transformed = string.IsNullOrWhiteSpace(transformed) ? text : transformed;
+        if (_romanizeCache.Count >= MaxRomanizeCacheEntries)
+            _romanizeCache.Clear();
+
         _romanizeCache[text] = transformed;
         return (text, transformed);
     }
@@ -102,14 +109,12 @@ private static bool ContainsJapanese(string text) =>
         AppLogger.Log("MusixmatchClient ctor");
 
         string baseDir = AppContext.BaseDirectory;
-        string ipaDicPath = Path.Combine(baseDir, "IpaDic");
+        _ipaDicPath = Path.Combine(baseDir, "IpaDic");
 
-        AppLogger.Log($"Kawazu dictionary path: {ipaDicPath}");
+        AppLogger.Log($"Kawazu dictionary path: {_ipaDicPath}");
 
-        if (!Directory.Exists(ipaDicPath))
-            throw new DirectoryNotFoundException($"Kawazu dictionary folder not found: {ipaDicPath}");
-
-        _kawazu = new KawazuConverter(ipaDicPath);
+        if (!Directory.Exists(_ipaDicPath))
+            throw new DirectoryNotFoundException($"Kawazu dictionary folder not found: {_ipaDicPath}");
 
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Host", "apic-appmobile.musixmatch.com");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("authority", "apic-appmobile.musixmatch.com");
@@ -119,6 +124,16 @@ private static bool ContainsJapanese(string text) =>
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "en-US,en;q=0.9");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Connection", "keep-alive");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
+    }
+
+    private KawazuConverter GetKawazuConverter()
+    {
+        if (_kawazu != null)
+            return _kawazu;
+
+        AppLogger.Log("Loading Kawazu dictionary for Japanese romanization");
+        _kawazu = new KawazuConverter(_ipaDicPath);
+        return _kawazu;
     }
 
     public async Task EnsureTokenAsync()

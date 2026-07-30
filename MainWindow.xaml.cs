@@ -98,67 +98,24 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, List<SyncedLyricLine>> _lyricsCache = new();
     private readonly Dictionary<string, List<KaraokeLine>> _karaokeCache = new();
     private readonly HashSet<string> _noLyricsCache = new();
+    private const int MaxLyricsCacheEntries = 25;
+    private const int MaxNoLyricsCacheEntries = 100;
     private DispatcherTimer? _renderTimer;
     private int _baseProgressMs = 0;
     private DateTime _baseProgressUtc = DateTime.UtcNow;
     private bool _isPlaying = false;
-    private Window? _logWindow;
-    private System.Windows.Controls.TextBox? _logTextBox;
-    private System.Windows.Controls.TextBlock? _logStatusText;
+    // Musixmatch timestamps commonly lead the audible vocal slightly. Delay
+    // presentation only; playback tracking remains based on the real position.
+    private const int LyricDisplayDelayMs = 150;
+    private LogViewerWindow? _logWindow;
 
     public ObservableCollection<DisplayLyricLine> VisibleLyrics { get; } = new();
 
-    private readonly string _windowSettingsPath =
-        System.IO.Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "lyrics_overlay",
-            "window_settings.json");
-
+    private readonly WindowSettingsStore _windowSettingsStore = new();
     private bool _restoringWindowSettings = false;
     private int _lastProgressMs = 0;
 
-    private static readonly System.Windows.Media.Color SungWordColor =
-        System.Windows.Media.Color.FromArgb(255, 255, 255, 255);
-
-    private static readonly System.Windows.Media.Color ActiveWordStartColor =
-        System.Windows.Media.Color.FromArgb(170, 255, 255, 255);
-
-    private static readonly System.Windows.Media.Color ActiveWordEndColor =
-        System.Windows.Media.Color.FromArgb(255, 255, 230, 120);
-
-    private static readonly System.Windows.Media.Color UpcomingWordColor =
-        System.Windows.Media.Color.FromArgb(120, 255, 255, 255);
-
-    private static readonly System.Windows.Media.SolidColorBrush SungWordBrush =
-        CreateFrozenBrush(SungWordColor);
-
-    private static readonly System.Windows.Media.SolidColorBrush UpcomingWordBrush =
-        CreateFrozenBrush(UpcomingWordColor);
-
-    static System.Windows.Media.SolidColorBrush CreateFrozenBrush(System.Windows.Media.Color color)
-    {
-        var brush = new System.Windows.Media.SolidColorBrush(color);
-        brush.Freeze();
-        return brush;
-    }
-
-    static System.Windows.Media.Color LerpColor(System.Windows.Media.Color from, System.Windows.Media.Color to, double t)
-    {
-        t = Math.Max(0.0, Math.Min(1.0, t));
-
-        byte a = (byte)Math.Round(from.A + ((to.A - from.A) * t));
-        byte r = (byte)Math.Round(from.R + ((to.R - from.R) * t));
-        byte g = (byte)Math.Round(from.G + ((to.G - from.G) * t));
-        byte b = (byte)Math.Round(from.B + ((to.B - from.B) * t));
-
-        return System.Windows.Media.Color.FromArgb(a, r, g, b);
-    }
-
-    static double EaseInOutSine(double t)
-    {
-        t = Math.Max(0.0, Math.Min(1.0, t));
-        return -(Math.Cos(Math.PI * t) - 1.0) / 2.0;
-    }
+    private readonly KaraokeSegmentRenderer _karaokeSegmentRenderer = new();
 
     private static Drawing.Icon LoadTrayIcon()
     {
@@ -291,18 +248,23 @@ public partial class MainWindow : Window
     {
         _renderTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(16)
+            // Thirty FPS is smooth for lyric highlighting while avoiding the
+            // short-lived UI objects and brushes created at 60 FPS.
+            Interval = TimeSpan.FromMilliseconds(33)
         };
 
         _renderTimer.Tick += (_, __) =>
         {
-            int progressMs = _baseProgressMs;
+            // Polling already updates ordinary synced lyrics. Only karaoke
+            // needs frame-by-frame refreshes for word highlighting.
+            if (!_isPlaying || !ShouldUseKaraokeRendering())
+                return;
 
-            if (_isPlaying)
-                progressMs += (int)(DateTime.UtcNow - _baseProgressUtc).TotalMilliseconds;
+            int progressMs = _baseProgressMs;
+            progressMs += (int)(DateTime.UtcNow - _baseProgressUtc).TotalMilliseconds;
 
             _lastProgressMs = progressMs;
-            RefreshVisibleLyrics(progressMs);
+            RefreshVisibleLyrics(Math.Max(0, progressMs - LyricDisplayDelayMs));
         };
 
         _renderTimer.Start();
@@ -417,15 +379,14 @@ public partial class MainWindow : Window
 
                         if (_syncedLyrics.Count == 0)
                         {
-                            _noLyricsCache.Add(state.TrackId);
+                            AddNoLyricsToCache(state.TrackId);
                             _currentTrackHasNoLyrics = true;
                             SetOverlayMessage($"{state.Artist} - {state.Title}");
                             AppLogger.Log($"Caching no-lyrics result for track {state.TrackId}");
                         }
                         else
                         {
-                            _lyricsCache[state.TrackId] = new List<SyncedLyricLine>(_syncedLyrics);
-                            _karaokeCache[state.TrackId] = CloneKaraokeLines(_karaokeLyrics);
+                            AddLyricsToCache(state.TrackId, _syncedLyrics, _karaokeLyrics);
                             _currentTrackHasNoLyrics = false;
                             AppLogger.Log($"Caching {_syncedLyrics.Count} lyrics and {_karaokeLyrics.Count} karaoke lines for track {state.TrackId}");
                             AppLogger.Log($"First synced line: {_syncedLyrics[0].StartTimeMs} ms | {_syncedLyrics[0].Text}");
@@ -457,6 +418,28 @@ public partial class MainWindow : Window
 
         _spotifyPollTimer.Start();
         AppLogger.Log("Spotify polling timer started");
+    }
+
+    private void AddLyricsToCache(string trackId, List<SyncedLyricLine> lyrics, List<KaraokeLine> karaoke)
+    {
+        _lyricsCache[trackId] = new List<SyncedLyricLine>(lyrics);
+        _karaokeCache[trackId] = CloneKaraokeLines(karaoke);
+        _noLyricsCache.Remove(trackId);
+
+        while (_lyricsCache.Count > MaxLyricsCacheEntries)
+        {
+            string evictedTrackId = _lyricsCache.Keys.First();
+            _lyricsCache.Remove(evictedTrackId);
+            _karaokeCache.Remove(evictedTrackId);
+            AppLogger.Log($"Evicted lyric cache for track {evictedTrackId}");
+        }
+    }
+
+    private void AddNoLyricsToCache(string trackId)
+    {
+        _noLyricsCache.Add(trackId);
+        while (_noLyricsCache.Count > MaxNoLyricsCacheEntries)
+            _noLyricsCache.Remove(_noLyricsCache.First());
     }
 
     private static bool HasRealRomanizedText(string original, string? romanized)
@@ -508,7 +491,7 @@ public partial class MainWindow : Window
             return;
 
         _lastProgressMs = progressMs;
-        RefreshVisibleLyrics(progressMs);
+        RefreshVisibleLyrics(Math.Max(0, progressMs - LyricDisplayDelayMs));
     }
 
     private static bool HasMeaningfulKaraoke(KaraokeLine? line)
@@ -658,140 +641,8 @@ public partial class MainWindow : Window
         return (start, end, previousLinesToShow);
     }
 
-    List<DisplayKaraokeSegment> BuildKaraokeSegments(KaraokeLine line, int progressMs)
-    {
-        var segments = new List<DisplayKaraokeSegment>();
-
-        if (line.Words == null || line.Words.Count == 0)
-        {
-            segments.Add(new DisplayKaraokeSegment
-            {
-                Text = "",
-                ForegroundBrush = UpcomingWordBrush
-            });
-            return segments;
-        }
-
-        for (int i = 0; i < line.Words.Count; i++)
-        {
-            var word = line.Words[i];
-            string text = word.RomanizedWord ?? word.Word ?? "";
-
-            if (string.IsNullOrEmpty(text))
-                continue;
-
-            int wordStartMs = line.StartTimeMs + word.OffsetMs;
-
-            int wordEndMs;
-            if (word.DurationMs > 0)
-                wordEndMs = wordStartMs + word.DurationMs;
-            else if (i + 1 < line.Words.Count)
-                wordEndMs = line.StartTimeMs + line.Words[i + 1].OffsetMs;
-            else
-                wordEndMs = line.EndTimeMs > wordStartMs ? line.EndTimeMs : wordStartMs + 900;
-
-            if (wordEndMs <= wordStartMs)
-                wordEndMs = wordStartMs + 120;
-
-            if (progressMs < wordStartMs)
-            {
-                segments.Add(new DisplayKaraokeSegment { Text = text, ForegroundBrush = UpcomingWordBrush });
-                continue;
-            }
-
-            if (progressMs >= wordEndMs)
-            {
-                segments.Add(new DisplayKaraokeSegment { Text = text, ForegroundBrush = SungWordBrush });
-                continue;
-            }
-
-            double rawT = (double)(progressMs - wordStartMs) / (wordEndMs - wordStartMs);
-            double easedT = EaseInOutSine(rawT);
-
-            int charCount = text.Length;
-            double charProgress = easedT * charCount;
-
-            int fullChars = Math.Clamp((int)Math.Floor(charProgress), 0, charCount);
-            double currentCharT = charProgress - fullChars;
-
-            if (fullChars > 0)
-            {
-                segments.Add(new DisplayKaraokeSegment
-                {
-                    Text = text.Substring(0, fullChars),
-                    ForegroundBrush = SungWordBrush
-                });
-            }
-
-            if (fullChars < charCount)
-            {
-                var currentChar = text.Substring(fullChars, 1);
-                var currentCharColor = LerpColor(ActiveWordStartColor, ActiveWordEndColor, currentCharT);
-
-                segments.Add(new DisplayKaraokeSegment
-                {
-                    Text = currentChar,
-                    ForegroundBrush = CreateFrozenBrush(currentCharColor)
-                });
-
-                if (fullChars + 1 < charCount)
-                {
-                    segments.Add(new DisplayKaraokeSegment
-                    {
-                        Text = text.Substring(fullChars + 1),
-                        ForegroundBrush = UpcomingWordBrush
-                    });
-                }
-            }
-        }
-
-        return MergeSegments(segments);
-    }
-
-    static bool SameBrush(System.Windows.Media.Brush a, System.Windows.Media.Brush b)
-    {
-        if (ReferenceEquals(a, b))
-            return true;
-
-        if (a is System.Windows.Media.SolidColorBrush sa &&
-            b is System.Windows.Media.SolidColorBrush sb)
-            return sa.Color == sb.Color;
-
-        return false;
-    }
-
-    List<DisplayKaraokeSegment> MergeSegments(List<DisplayKaraokeSegment> rawSegments)
-    {
-        if (rawSegments.Count <= 1)
-            return rawSegments;
-
-        var merged = new List<DisplayKaraokeSegment>();
-        var current = new DisplayKaraokeSegment
-        {
-            Text = rawSegments[0].Text,
-            ForegroundBrush = rawSegments[0].ForegroundBrush
-        };
-
-        for (int i = 1; i < rawSegments.Count; i++)
-        {
-            if (SameBrush(current.ForegroundBrush, rawSegments[i].ForegroundBrush))
-            {
-                current.Text += rawSegments[i].Text;
-            }
-            else
-            {
-                merged.Add(current);
-                current = new DisplayKaraokeSegment
-                {
-                    Text = rawSegments[i].Text,
-                    ForegroundBrush = rawSegments[i].ForegroundBrush
-                };
-            }
-        }
-
-        merged.Add(current);
-        return merged;
-    }
+    List<DisplayKaraokeSegment> BuildKaraokeSegments(KaraokeLine line, int progressMs) =>
+        _karaokeSegmentRenderer.Build(line, progressMs);
 
     void ReplaceVisibleLyrics(IEnumerable<DisplayLyricLine> lines)
     {
@@ -816,147 +667,15 @@ public partial class MainWindow : Window
 
     void ShowLogWindow()
     {
-        if (_logWindow != null)
+        if (_logWindow == null)
         {
-            _logWindow.Show();
-            _logWindow.Activate();
-            RefreshLogWindow();
-            return;
+            _logWindow = new LogViewerWindow(this);
+            _logWindow.Closed += (_, __) => _logWindow = null;
         }
 
-        var grid = new System.Windows.Controls.Grid();
-        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-
-        _logStatusText = new System.Windows.Controls.TextBlock
-        {
-            Margin = new Thickness(10, 10, 10, 6)
-        };
-        Grid.SetRow(_logStatusText, 0);
-        grid.Children.Add(_logStatusText);
-
-        _logTextBox = new System.Windows.Controls.TextBox
-        {
-            Margin = new Thickness(10, 0, 10, 10),
-            IsReadOnly = true,
-            AcceptsReturn = true,
-            AcceptsTab = true,
-            VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
-            HorizontalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
-            TextWrapping = TextWrapping.NoWrap,
-            FontFamily = new System.Windows.Media.FontFamily("Consolas")
-        };
-        Grid.SetRow(_logTextBox, 1);
-        grid.Children.Add(_logTextBox);
-
-        var buttons = new StackPanel
-        {
-            Orientation = System.Windows.Controls.Orientation.Horizontal,
-            HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
-            Margin = new Thickness(10, 0, 10, 10)
-        };
-
-        var copyButton = new System.Windows.Controls.Button
-        {
-            Content = "Copy",
-            Margin = new Thickness(0, 0, 8, 0),
-            Padding = new Thickness(12, 4, 12, 4)
-        };
-        copyButton.Click += (_, __) =>
-        {
-            if (_logTextBox == null)
-                return;
-
-            string textToCopy = !string.IsNullOrEmpty(_logTextBox.SelectedText)
-                ? _logTextBox.SelectedText
-                : _logTextBox.Text;
-
-            if (!string.IsNullOrEmpty(textToCopy))
-                System.Windows.Clipboard.SetText(textToCopy);
-        };
-
-        var clearButton = new System.Windows.Controls.Button
-        {
-            Content = "Clear",
-            Margin = new Thickness(0, 0, 8, 0),
-            Padding = new Thickness(12, 4, 12, 4)
-        };
-        clearButton.Click += (_, __) => AppLogger.Clear();
-
-        var pauseButton = new System.Windows.Controls.Button
-        {
-            Content = AppLogger.IsMemoryLoggingPaused ? "Resume Logging" : "Pause Logging",
-            Margin = new Thickness(0, 0, 8, 0),
-            Padding = new Thickness(12, 4, 12, 4)
-        };
-
-        pauseButton.Click += (_, __) =>
-        {
-            bool newPaused = !AppLogger.IsMemoryLoggingPaused;
-            AppLogger.SetMemoryLoggingPaused(newPaused);
-            pauseButton.Content = newPaused ? "Resume Logging" : "Pause Logging";
-        };
-
-        var closeButton = new System.Windows.Controls.Button
-        {
-            Content = "Close",
-            Padding = new Thickness(12, 4, 12, 4)
-        };
-        closeButton.Click += (_, __) => _logWindow?.Hide();
-
-        buttons.Children.Add(copyButton);
-        buttons.Children.Add(pauseButton);
-        buttons.Children.Add(clearButton);
-        buttons.Children.Add(closeButton);
-
-        Grid.SetRow(buttons, 2);
-        grid.Children.Add(buttons);
-
-        _logWindow = new Window
-        {
-            Title = "Active Log",
-            Width = 900,
-            Height = 500,
-            Content = grid,
-            Owner = this
-        };
-
-        _logWindow.Closed += (_, __) =>
-        {
-            AppLogger.LogChanged -= RefreshLogWindow;
-            _logWindow = null;
-            _logTextBox = null;
-            _logStatusText = null;
-        };
-
-        _logWindow.IsVisibleChanged += (_, __) =>
-        {
-            if (_logWindow?.IsVisible == true)
-                RefreshLogWindow();
-        };
-
-        AppLogger.LogChanged += RefreshLogWindow;
-
-        RefreshLogWindow();
         _logWindow.Show();
-    }
-
-    void RefreshLogWindow()
-    {
-        Dispatcher.Invoke(() =>
-        {
-            if (_logWindow?.IsVisible != true || _logTextBox == null || _logStatusText == null)
-                return;
-
-            _logTextBox.Text = AppLogger.GetLogText();
-            _logTextBox.CaretIndex = _logTextBox.Text.Length;
-            _logTextBox.ScrollToEnd();
-
-            double mib = AppLogger.GetStoredBytes() / 1024.0 / 1024.0;
-            string state = AppLogger.IsMemoryLoggingPaused ? "Paused" : "Recording";
-            _logStatusText.Text = $"State: {state} | Entries: {AppLogger.GetEntryCount()} | Memory: {mib:F2} MiB / 1.00 MiB";
-        });
+        _logWindow.Activate();
+        _logWindow.Refresh();
     }
     void SetupTrayIcon()
     {
@@ -1164,25 +883,16 @@ public partial class MainWindow : Window
 
     void LoadWindowSettings()
     {
+        var settings = _windowSettingsStore.Load();
+        if (settings == null)
+        {
+            ApplyDefaultWindowSettings();
+            return;
+        }
+
+        _restoringWindowSettings = true;
         try
         {
-            if (!System.IO.File.Exists(_windowSettingsPath))
-            {
-                AppLogger.Log("No saved window settings found, using defaults");
-                Width = 900;
-                Height = 220;
-                Left = (SystemParameters.PrimaryScreenWidth - Width) / 2;
-                Top = SystemParameters.PrimaryScreenHeight - Height - 120;
-                return;
-            }
-
-            string json = System.IO.File.ReadAllText(_windowSettingsPath);
-            var settings = JsonSerializer.Deserialize<WindowSettings>(json);
-            if (settings == null)
-                return;
-
-            _restoringWindowSettings = true;
-
             Width = IsValidWindowNumber(settings.Width) && settings.Width > 0 ? settings.Width : 900;
             Height = IsValidWindowNumber(settings.Height) && settings.Height > 0 ? settings.Height : 220;
             Left = IsValidWindowNumber(settings.Left) ? settings.Left : (SystemParameters.PrimaryScreenWidth - Width) / 2;
@@ -1192,50 +902,33 @@ public partial class MainWindow : Window
 
             AppLogger.Log($"Loaded window settings Left={Left} Top={Top} Width={Width} Height={Height} TextOnlyMode={_textOnlyMode} ShowRomanizedText={showRomanizedText}");
         }
-        catch (Exception ex)
-        {
-            AppLogger.Log($"LoadWindowSettings failed: {ex}");
-        }
         finally
         {
             _restoringWindowSettings = false;
         }
     }
 
+    void ApplyDefaultWindowSettings()
+    {
+        Width = 900;
+        Height = 220;
+        Left = (SystemParameters.PrimaryScreenWidth - Width) / 2;
+        Top = SystemParameters.PrimaryScreenHeight - Height - 120;
+    }
+
     void SaveWindowSettings()
     {
-        try
+        if (_restoringWindowSettings || !IsLoaded)
+            return;
+
+        if (WindowState != WindowState.Normal)
         {
-            if (_restoringWindowSettings)
-                return;
-
-            if (!IsLoaded)
-                return;
-
-            if (WindowState != WindowState.Normal)
-            {
-                AppLogger.Log($"Skipping SaveWindowSettings because WindowState={WindowState}");
-                return;
-            }
-
-            if (!TryGetSafeWindowSettings(out var settings))
-                return;
-
-            var dir = System.IO.Path.GetDirectoryName(_windowSettingsPath)!;
-            System.IO.Directory.CreateDirectory(dir);
-
-            string json = JsonSerializer.Serialize(settings, new JsonSerializerOptions
-            {
-                WriteIndented = true
-            });
-
-            System.IO.File.WriteAllText(_windowSettingsPath, json);
-            AppLogger.Log($"Saved window settings | Left={settings.Left} | Top={settings.Top} | Width={settings.Width} | Height={settings.Height} | TextOnlyMode={settings.TextOnlyMode}");
+            AppLogger.Log($"Skipping SaveWindowSettings because WindowState={WindowState}");
+            return;
         }
-        catch (Exception ex)
-        {
-            AppLogger.Log($"SaveWindowSettings failed: {ex}");
-        }
+
+        if (TryGetSafeWindowSettings(out var settings))
+            _windowSettingsStore.Save(settings);
     }
 
     bool TryGetSafeWindowSettings(out WindowSettings settings)
@@ -1289,7 +982,6 @@ public static class AppLogger
     private static readonly object _sync = new();
     private static readonly Queue<LogEntry> _entries = new();
     private static int _totalBytes;
-
     private const int MaxBytes = 1024 * 1024;
 
     public static event Action? LogChanged;
@@ -1678,17 +1370,18 @@ public class SpotifyPlaybackState
 
 public class SpotifyClient
 {
+    private static readonly HttpClient Http = new();
+
     public async Task<SpotifyPlaybackState?> GetPlaybackAsync(string accessToken)
     {
         AppLogger.Log($"SpotifyClient.GetPlaybackAsync begin, accessTokenLength={accessToken?.Length ?? 0}");
 
         var requestStart = Stopwatch.GetTimestamp();
 
-        using var http = new HttpClient();
-        http.DefaultRequestHeaders.Authorization =
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.spotify.com/v1/me/player");
+        request.Headers.Authorization =
             new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
-
-        var resp = await http.GetAsync("https://api.spotify.com/v1/me/player");
+        using var resp = await Http.SendAsync(request);
 
         var requestEnd = Stopwatch.GetTimestamp();
         var rttMs = (requestEnd - requestStart) * 1000.0 / Stopwatch.Frequency;
