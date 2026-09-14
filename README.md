@@ -108,6 +108,7 @@ If Spotify playback is not available, the app can fall back to SMTC session data
   - Enable dragging
   - Enable resizing
   - Toggle text-only mode
+  - Toggle current-line-only mode
   - Open the active log or write a memory-profile report to it
   - Exit the app
 
