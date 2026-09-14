@@ -37,7 +37,7 @@ public sealed class WindowSettingsStore
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
             File.WriteAllText(_settingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
-            AppLogger.Log($"Saved window settings | Left={settings.Left} | Top={settings.Top} | Width={settings.Width} | Height={settings.Height} | TextOnlyMode={settings.TextOnlyMode}");
+            AppLogger.Log($"Saved window settings | Left={settings.Left} | Top={settings.Top} | Width={settings.Width} | Height={settings.Height} | TextOnlyMode={settings.TextOnlyMode} | CurrentLineOnlyMode={settings.CurrentLineOnlyMode}");
         }
         catch (Exception ex)
         {
