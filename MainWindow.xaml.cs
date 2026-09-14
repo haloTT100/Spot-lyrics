@@ -86,6 +86,7 @@ public partial class MainWindow : Window
     private bool _isDraggable = false;
     private bool _isResizable = false;
     private bool _textOnlyMode = true;
+    private bool _currentLineOnlyMode = false;
     private List<SyncedLyricLine> _syncedLyrics = new();
     private List<KaraokeLine> _karaokeLyrics = new();
     private DispatcherTimer? _spotifyPollTimer;
@@ -632,6 +633,9 @@ public partial class MainWindow : Window
 
     (int start, int end, int previousLinesToShow) CalculateVisibleRange(int currentIndex, int totalCount)
     {
+        if (_currentLineOnlyMode)
+            return (currentIndex, currentIndex, 0);
+
         double estimatedLineHeight = 42;
         double usableHeight = Math.Max(120, ActualHeight - 36);
         int visibleLineCount = Math.Max(3, (int)Math.Floor(usableHeight / estimatedLineHeight));
@@ -782,6 +786,20 @@ public partial class MainWindow : Window
         };
         menu.Items.Add(textOnlyItem);
 
+        var currentLineOnlyItem = new Forms.ToolStripMenuItem("Current line only")
+        {
+            CheckOnClick = true,
+            Checked = _currentLineOnlyMode
+        };
+        currentLineOnlyItem.CheckedChanged += (_, __) =>
+        {
+            _currentLineOnlyMode = currentLineOnlyItem.Checked;
+            AppLogger.Log($"Tray menu: CurrentLineOnlyMode changed to {_currentLineOnlyMode}");
+            RefreshVisibleLyrics(Math.Max(0, _lastProgressMs - LyricDisplayDelayMs));
+            SaveWindowSettings();
+        };
+        menu.Items.Add(currentLineOnlyItem);
+
         var romanizedItem = new Forms.ToolStripMenuItem("Always show original text")
         {
             CheckOnClick = true,
@@ -925,9 +943,10 @@ public partial class MainWindow : Window
             Left = IsValidWindowNumber(settings.Left) ? settings.Left : (SystemParameters.PrimaryScreenWidth - Width) / 2;
             Top = IsValidWindowNumber(settings.Top) ? settings.Top : (SystemParameters.PrimaryScreenHeight - Height - 120);
             _textOnlyMode = settings.TextOnlyMode;
+            _currentLineOnlyMode = settings.CurrentLineOnlyMode;
             showRomanizedText = settings.ShowRomanizedText;
 
-            AppLogger.Log($"Loaded window settings Left={Left} Top={Top} Width={Width} Height={Height} TextOnlyMode={_textOnlyMode} ShowRomanizedText={showRomanizedText}");
+            AppLogger.Log($"Loaded window settings Left={Left} Top={Top} Width={Width} Height={Height} TextOnlyMode={_textOnlyMode} CurrentLineOnlyMode={_currentLineOnlyMode} ShowRomanizedText={showRomanizedText}");
         }
         finally
         {
@@ -986,6 +1005,7 @@ public partial class MainWindow : Window
             Width = width,
             Height = height,
             TextOnlyMode = _textOnlyMode,
+            CurrentLineOnlyMode = _currentLineOnlyMode,
             ShowRomanizedText = showRomanizedText
         };
 
@@ -1123,6 +1143,7 @@ public class WindowSettings
     public double Width { get; set; }
     public double Height { get; set; }
     public bool TextOnlyMode { get; set; } = true;
+    public bool CurrentLineOnlyMode { get; set; }
     public bool ShowRomanizedText { get; set; } = true;
 }
 
