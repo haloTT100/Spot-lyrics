@@ -795,7 +795,7 @@ public partial class MainWindow : Window
         {
             _currentLineOnlyMode = currentLineOnlyItem.Checked;
             AppLogger.Log($"Tray menu: CurrentLineOnlyMode changed to {_currentLineOnlyMode}");
-            RefreshVisibleLyrics(_lastProgressMs);
+            RefreshVisibleLyrics(Math.Max(0, _lastProgressMs - LyricDisplayDelayMs));
             SaveWindowSettings();
         };
         menu.Items.Add(currentLineOnlyItem);
