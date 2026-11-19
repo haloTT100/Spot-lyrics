@@ -8,7 +8,7 @@ It tracks the current song from Spotify, fetches synced lyrics, and renders them
 - Always-on-top WPF lyrics overlay
 - Spotify Web API as the primary playback source
 - SMTC (System Media Transport Controls) fallback when Spotify playback data is unavailable
-- Synced lyric fetching through Musixmatch
+- Lyrics from LRCLIB and Musixmatch, selected in this order: LRCLIB word-synced lyrics, Musixmatch karaoke, Musixmatch synced, LRCLIB synced, Musixmatch unsynced, then instrumental
 - Karaoke-style per-word highlighting
 - Tray icon controls for show/hide, drag, resize, and text-only mode
 - Window position and size persistence
@@ -23,7 +23,8 @@ Spot-lyrics separates playback detection from lyric rendering:
   - Primary: Spotify Web API
   - Fallback: SMTC
 - **Lyrics layer**
-  - Musixmatch for synced, unsynced, and karaoke-capable lyrics
+  - LRCLIB `lyricsfile` YAML for word-synced lyrics and LRCLIB LRC for line-synced fallback
+  - Musixmatch for karaoke, synced, and unsynced fallback lyrics
 - **Rendering layer**
   - WPF overlay with an `ObservableCollection`-based display pipeline
   - Reused lyric-line containers, cached karaoke brushes, and throttled karaoke updates to reduce WPF allocation churn
@@ -52,6 +53,7 @@ The profiler samples once every 10 seconds and stores only the latest 60 samples
 - Spotify Web API
 - Windows SMTC (`Windows.Media.Control`)
 - Musixmatch
+- LRCLIB
 - Kawazu for romanization support
 
 ## Requirements
@@ -133,6 +135,7 @@ The remaining core pieces include:
 - `MainWindow.xaml` — overlay UI
 - `MainWindow.xaml.cs` — playback polling, overlay state, lyric rendering pipeline
 - `MusixmatchClient.cs` — lyric lookup, rich sync, subtitle parsing, romanization
+- `LrclibClient.cs` — LRCLIB lookup, Lyricsfile 1.0 word-sync parsing, and LRC parsing
 - Spotify auth/client classes — OAuth and playback fetch
 - playback source implementations — Spotify primary, SMTC fallback
 

@@ -77,6 +77,7 @@ public partial class MainWindow : Window
     static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
 
     private readonly MusixmatchClient _musixmatch = new();
+    private readonly LrclibClient _lrclib = new();
     private IPlaybackSource? _playbackSource;
     private IPlaybackSource? _spotifySource;
     private IPlaybackSource? _fallbackSource;
@@ -367,17 +368,68 @@ public partial class MainWindow : Window
                     }
                     else
                     {
-                        _syncedLyrics = await _musixmatch.GetSyncedLyricsAsync(
+                        var lrclibLyrics = await _lrclib.GetLyricsAsync(
+                            state.Artist,
+                            state.Title,
+                            state.Album,
+                            state.DurationMs,
+                            _musixmatch.TransformLyricTextAsync);
+                        var musixmatchLyrics = await _musixmatch.GetLyricsCandidatesAsync(
                             state.Artist,
                             state.Title,
                             state.Album,
                             state.Uri,
-                            state.DurationMs
-                        );
+                            state.DurationMs);
 
-                        _karaokeLyrics = CloneKaraokeLines(_musixmatch.LastKaraokeLines);
+                        string lyricsSource;
+                        if (lrclibLyrics?.WordSyncedKaraokeLines.Count > 0)
+                        {
+                            _syncedLyrics = new List<SyncedLyricLine>(lrclibLyrics.WordSyncedLyricLines);
+                            _karaokeLyrics = CloneKaraokeLines(lrclibLyrics.WordSyncedKaraokeLines);
+                            lyricsSource = "LRCLIB word-synced lyricsfile";
+                        }
+                        else if (musixmatchLyrics.KaraokeLines.Count > 0 && musixmatchLyrics.KaraokeSyncedLines.Count > 0)
+                        {
+                            _syncedLyrics = new List<SyncedLyricLine>(musixmatchLyrics.KaraokeSyncedLines);
+                            _karaokeLyrics = CloneKaraokeLines(musixmatchLyrics.KaraokeLines);
+                            lyricsSource = "Musixmatch karaoke";
+                        }
+                        else if (musixmatchLyrics.SyncedLines.Count > 0)
+                        {
+                            _syncedLyrics = new List<SyncedLyricLine>(musixmatchLyrics.SyncedLines);
+                            _karaokeLyrics.Clear();
+                            lyricsSource = "Musixmatch synced";
+                        }
+                        else if (lrclibLyrics?.SyncedLyrics.Count > 0)
+                        {
+                            _syncedLyrics = new List<SyncedLyricLine>(lrclibLyrics.SyncedLyrics);
+                            _karaokeLyrics.Clear();
+                            lyricsSource = "LRCLIB synced";
+                        }
+                        else if (musixmatchLyrics.UnsyncedLines.Count > 0)
+                        {
+                            _syncedLyrics = new List<SyncedLyricLine>(musixmatchLyrics.UnsyncedLines);
+                            _karaokeLyrics.Clear();
+                            lyricsSource = "Musixmatch unsynced";
+                        }
+                        else if (lrclibLyrics?.IsInstrumental == true || musixmatchLyrics.IsInstrumental)
+                        {
+                            _syncedLyrics = new List<SyncedLyricLine>
+                            {
+                                new SyncedLyricLine { Text = "\u266A Instrumental \u266A", StartTimeMs = 0 }
+                            };
+                            _karaokeLyrics.Clear();
+                            lyricsSource = "instrumental";
+                        }
+                        else
+                        {
+                            _syncedLyrics.Clear();
+                            _karaokeLyrics.Clear();
+                            lyricsSource = "none";
+                        }
 
-                        AppLogger.Log($"Musixmatch returned {_syncedLyrics.Count} synced lines and {_karaokeLyrics.Count} karaoke lines for {state.Artist} - {state.Title}");
+                        AppLogger.Log($"Selected lyrics source: {lyricsSource} for {state.Artist} - {state.Title}");
+                        AppLogger.Log($"Lyrics result has {_syncedLyrics.Count} lines and {_karaokeLyrics.Count} karaoke lines for {state.Artist} - {state.Title}");
 
                         if (_syncedLyrics.Count == 0)
                         {
