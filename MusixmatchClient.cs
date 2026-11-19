@@ -27,7 +27,7 @@ public class MusixmatchClient
     public List<KaraokeLine> LastKaraokeLines { get; private set; } = new();
     public bool RomanizeLyrics { get; set; } = true;
 
-    private async Task<(string original, string display)> TransformLyricTextAsync(string text)
+    public async Task<(string original, string display)> TransformLyricTextAsync(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
             return (text, text);
@@ -195,6 +195,89 @@ private static bool ContainsJapanese(string text) =>
             AppLogger.Log($"Musixmatch token HTTP exception: {ex.Message}");
             UserToken = "";
         }
+    }
+
+    public async Task<MusixmatchLyricsCandidates> GetLyricsCandidatesAsync(
+        string artist,
+        string title,
+        string album,
+        string spotifyUri,
+        int durationMs)
+    {
+        var candidates = new MusixmatchLyricsCandidates();
+        LastKaraokeLines = new List<KaraokeLine>();
+
+        try
+        {
+            await EnsureTokenAsync();
+            using var macroDoc = await GetMacroSubtitlesAsync(artist, title, album, spotifyUri, durationMs);
+            var root = macroDoc.RootElement;
+            var macroCalls = root.GetProperty("message").GetProperty("body").GetProperty("macro_calls");
+            var matcherTrackGet = macroCalls.GetProperty("matcher.track.get");
+            int matcherStatus = matcherTrackGet.GetProperty("message").GetProperty("header").GetProperty("status_code").GetInt32();
+
+            if (matcherStatus != 200)
+            {
+                AppLogger.Log($"Musixmatch matcher.track.get status={matcherStatus}; no candidates available");
+                return candidates;
+            }
+
+            var trackBody = matcherTrackGet.GetProperty("message").GetProperty("body");
+            if (!trackBody.TryGetProperty("track", out var track) || track.ValueKind != JsonValueKind.Object)
+                return candidates;
+
+            candidates.IsInstrumental = TryGetBool(track, "instrumental");
+            bool hasRichSync = TryGetBool(track, "has_richsync");
+            bool hasSubtitles = TryGetBool(track, "has_subtitles");
+            bool hasLyrics = TryGetBool(track, "has_lyrics");
+            bool hasLyricsCrowd = TryGetBool(track, "has_lyrics_crowd");
+
+            if (hasRichSync)
+            {
+                try
+                {
+                    candidates.KaraokeSyncedLines = await GetKaraokeAsync(track);
+                    candidates.KaraokeLines = new List<KaraokeLine>(LastKaraokeLines);
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Log($"Musixmatch karaoke lookup failed: {ex.Message}");
+                    LastKaraokeLines = new List<KaraokeLine>();
+                }
+            }
+
+            if (hasSubtitles)
+            {
+                try
+                {
+                    candidates.SyncedLines = await GetSyncedFromMacroAsync(macroCalls);
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Log($"Musixmatch synced lyric lookup failed: {ex.Message}");
+                }
+            }
+
+            if (hasLyrics || hasLyricsCrowd)
+            {
+                try
+                {
+                    candidates.UnsyncedLines = await GetUnsyncedFromMacroAsync(macroCalls);
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Log($"Musixmatch unsynced lyric lookup failed: {ex.Message}");
+                }
+            }
+
+            AppLogger.Log($"Musixmatch candidates | karaoke={candidates.KaraokeLines.Count} | synced={candidates.SyncedLines.Count} | unsynced={candidates.UnsyncedLines.Count} | instrumental={candidates.IsInstrumental}");
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log($"Musixmatch candidate request failed: {ex.Message}");
+        }
+
+        return candidates;
     }
 
     public async Task<List<SyncedLyricLine>> GetSyncedLyricsAsync(
@@ -735,4 +818,13 @@ public class KaraokeLine
     public string FullText => string.Concat(Words.Select(w => w.RomanizedWord ?? w.Word ?? ""));
     public string OriginalFullText => string.Concat(Words.Select(w => w.OriginalWord ?? w.Word ?? ""));
     public string RomanizedFullText => string.Concat(Words.Select(w => w.RomanizedWord ?? w.Word ?? ""));
+}
+
+public sealed class MusixmatchLyricsCandidates
+{
+    public bool IsInstrumental { get; set; }
+    public List<SyncedLyricLine> KaraokeSyncedLines { get; set; } = new();
+    public List<KaraokeLine> KaraokeLines { get; set; } = new();
+    public List<SyncedLyricLine> SyncedLines { get; set; } = new();
+    public List<SyncedLyricLine> UnsyncedLines { get; set; } = new();
 }

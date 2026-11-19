@@ -22,6 +22,7 @@
     <Resource Include="Assets\AppIcon.ico" />
     <PackageReference Include="Kawazu" Version="1.1.4" />
     <PackageReference Include="LibNMeCab.IpaDicBin" Version="0.10.0" />
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
   </ItemGroup>
 
 </Project>
