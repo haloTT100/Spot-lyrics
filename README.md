@@ -41,7 +41,7 @@ To inspect runtime memory, open the tray menu and select **Log Memory Profile**.
 
 - Working set and private memory
 - Managed live memory, GC heap size, and fragmentation
-- Managed allocation rate and memory growth since profiling began
+- Managed allocation rate and memory growth over the retained sampling window
 - Handle, thread, and GC collection counts
 
 The profiler samples once every 10 seconds and stores only the latest 60 samples.
@@ -110,6 +110,7 @@ If Spotify playback is not available, the app can fall back to SMTC session data
   - Enable dragging
   - Enable resizing
   - Toggle text-only mode
+  - Toggle current-line-only mode
   - Open the active log or write a memory-profile report to it
   - Exit the app
 
