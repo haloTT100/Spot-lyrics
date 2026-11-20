@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Net.Http;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text.Json;
 
 namespace lyrics_overlay;
@@ -14,6 +15,7 @@ public sealed class AppUpdateInfo
     public required string TagName { get; init; }
     public required string AssetName { get; init; }
     public required string DownloadUrl { get; init; }
+    public required string Sha256 { get; init; }
     public required Uri ReleaseUrl { get; init; }
 }
 
@@ -119,8 +121,7 @@ public sealed class AppUpdater
                 }
 
                 string name = nameElement.GetString() ?? "";
-                if (name.StartsWith("Spot-lyrics-v", StringComparison.OrdinalIgnoreCase) &&
-                    name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                if (name.Equals($"Spot-lyrics-v{version}.zip", StringComparison.OrdinalIgnoreCase))
                 {
                     zipAsset = asset;
                     break;
@@ -136,6 +137,31 @@ public sealed class AppUpdater
 
             string downloadUrl = urlElement.GetString() ?? "";
             string assetName = assetElement.GetProperty("name").GetString() ?? "";
+            if (!Uri.TryCreate(downloadUrl, UriKind.Absolute, out var downloadUri) ||
+                !IsAllowedGitHubDownloadHost(downloadUri))
+            {
+                return (null, new InvalidOperationException("The update asset URL is not from GitHub."));
+            }
+
+            if (!assetElement.TryGetProperty("digest", out var digestElement) ||
+                digestElement.ValueKind != JsonValueKind.String)
+            {
+                return (null, new InvalidOperationException("The update asset has no GitHub SHA-256 digest."));
+            }
+
+            string digest = digestElement.GetString() ?? "";
+            if (!digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase))
+            {
+                return (null, new InvalidOperationException("The update asset has an unsupported digest."));
+            }
+
+            string sha256 = digest["sha256:".Length..];
+            if (sha256.Length != 64 ||
+                !sha256.All(character => Uri.IsHexDigit(character)))
+            {
+                return (null, new InvalidOperationException("The update asset SHA-256 digest is invalid."));
+            }
+
             string releaseUrlText = root.TryGetProperty("html_url", out var releaseUrlElement)
                 ? releaseUrlElement.GetString() ?? ""
                 : "";
@@ -146,6 +172,7 @@ public sealed class AppUpdater
                 TagName = tagName,
                 AssetName = assetName,
                 DownloadUrl = downloadUrl,
+                Sha256 = sha256,
                 ReleaseUrl = Uri.TryCreate(releaseUrlText, UriKind.Absolute, out var releaseUrl)
                     ? releaseUrl
                     : new Uri($"https://github.com/{Repository}/releases")
@@ -236,7 +263,7 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
             Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(tempRoot);
 
-        string archivePath = Path.Combine(tempRoot, update.AssetName);
+        string archivePath = Path.Combine(tempRoot, "update.zip");
         using (var download = await Http.GetAsync(
                    update.DownloadUrl,
                    HttpCompletionOption.ResponseHeadersRead))
@@ -245,6 +272,20 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
             await using var source = await download.Content.ReadAsStreamAsync();
             await using var destination = File.Create(archivePath);
             await source.CopyToAsync(destination);
+        }
+
+        string actualSha256;
+        await using (var archive = File.OpenRead(archivePath))
+        {
+            byte[] hash = await SHA256.HashDataAsync(archive);
+            actualSha256 = Convert.ToHexString(hash).ToLowerInvariant();
+        }
+
+        if (!CryptographicOperations.FixedTimeEquals(
+                Convert.FromHexString(update.Sha256),
+                Convert.FromHexString(actualSha256)))
+        {
+            throw new InvalidOperationException("The downloaded update failed SHA-256 verification.");
         }
 
         string stagingDirectory = Path.Combine(tempRoot, "staged");
@@ -264,6 +305,13 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
         using var archive = ZipFile.OpenRead(archivePath);
         foreach (var entry in archive.Entries)
         {
+            if (entry.FullName.Contains('\\') ||
+                entry.FullName.Contains(':') ||
+                entry.FullName.Contains("..", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("The update archive contains an invalid path.");
+            }
+
             if (string.IsNullOrEmpty(entry.Name))
             {
                 string directoryPath = Path.GetFullPath(
@@ -276,6 +324,10 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
             string targetPath = Path.GetFullPath(
                 Path.Combine(destinationRoot, entry.FullName));
             EnsureInsideDestination(destinationRoot, targetPath);
+            if (!IsAllowedUpdateFile(entry.FullName))
+                throw new InvalidOperationException(
+                    $"The update archive contains an unexpected file: {entry.FullName}");
+
             Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
 
             using var source = entry.Open();
@@ -288,6 +340,40 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
     {
         if (!targetPath.StartsWith(destinationRoot, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("The update archive contains an invalid path.");
+    }
+
+    private static bool IsAllowedGitHubDownloadHost(Uri downloadUri)
+    {
+        if (!downloadUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return downloadUri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase) ||
+               downloadUri.Host.Equals("objects.githubusercontent.com", StringComparison.OrdinalIgnoreCase) ||
+               downloadUri.Host.EndsWith(".release-assets.githubusercontent.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAllowedUpdateFile(string relativePath)
+    {
+        if (relativePath.StartsWith("IpaDic/", StringComparison.OrdinalIgnoreCase) &&
+            !relativePath.EndsWith("/", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        string fileName = Path.GetFileName(relativePath);
+        if (fileName.Equals("SpotLyrics.exe", StringComparison.OrdinalIgnoreCase) ||
+            fileName.Equals("SpotLyrics.dll", StringComparison.OrdinalIgnoreCase) ||
+            fileName.Equals("SpotLyrics.runtimeconfig.json", StringComparison.OrdinalIgnoreCase) ||
+            fileName.Equals("SpotLyrics.deps.json", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        string extension = Path.GetExtension(fileName);
+        return extension.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".json", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".config", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string EscapeSingleQuoted(string value) =>
