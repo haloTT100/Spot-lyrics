@@ -326,6 +326,7 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
             "SpotLyrics.dll" => Path.Combine(destinationDirectory, "SpotLyrics.dll"),
             "SpotLyrics.runtimeconfig.json" => Path.Combine(destinationDirectory, "SpotLyrics.runtimeconfig.json"),
             "SpotLyrics.deps.json" => Path.Combine(destinationDirectory, "SpotLyrics.deps.json"),
+            "SpotLyrics.pdb" => Path.Combine(destinationDirectory, "SpotLyrics.pdb"),
             "Kawazu.dll" => Path.Combine(destinationDirectory, "Kawazu.dll"),
             "LibNMeCab.dll" => Path.Combine(destinationDirectory, "LibNMeCab.dll"),
             "LibNMeCab.IpaDicBin.dll" => Path.Combine(destinationDirectory, "LibNMeCab.IpaDicBin.dll"),
