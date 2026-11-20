@@ -118,6 +118,9 @@ public partial class MainWindow : Window
     private int _lastProgressMs = 0;
 
     private readonly KaraokeSegmentRenderer _karaokeSegmentRenderer = new();
+    private readonly AppUpdater _appUpdater = new();
+    private Forms.ToolStripMenuItem? _updateMenuItem;
+    private AppUpdateInfo? _availableUpdate;
 
     private static Drawing.Icon LoadTrayIcon()
     {
@@ -191,6 +194,7 @@ public partial class MainWindow : Window
                 LoadWindowSettings();
                 MakeClickThrough();
                 SetupTrayIcon();
+                _ = CheckForUpdatesAsync(showManualResult: false);
 
                 ApplyOverlayStyle();
                 await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
@@ -764,6 +768,12 @@ public partial class MainWindow : Window
             Text = "Spot Lyrics"
         };
 
+        _trayIcon.BalloonTipClicked += (_, __) =>
+        {
+            if (_availableUpdate != null)
+                _ = ApplyUpdateAndRestartAsync();
+        };
+
         var menu = new Forms.ContextMenuStrip();
 
         menu.Items.Add("Show", null, (_, __) =>
@@ -795,6 +805,18 @@ public partial class MainWindow : Window
             RuntimeProfiler.LogReport();
             ShowLogWindow();
         });
+
+        _updateMenuItem = new Forms.ToolStripMenuItem(
+            $"Check for updates (v{AppUpdater.GetCurrentVersion()})",
+            null,
+            (_, __) =>
+            {
+                if (_availableUpdate != null)
+                    _ = ApplyUpdateAndRestartAsync();
+                else
+                    _ = CheckForUpdatesAsync(showManualResult: true);
+            });
+        menu.Items.Add(_updateMenuItem);
 
         menu.Items.Add(new Forms.ToolStripSeparator());
 
@@ -883,6 +905,98 @@ public partial class MainWindow : Window
         };
 
         AppLogger.Log("SetupTrayIcon end");
+    }
+
+    private async Task CheckForUpdatesAsync(bool showManualResult)
+    {
+        if (_updateMenuItem != null)
+        {
+            await Dispatcher.InvokeAsync(() =>
+                _updateMenuItem.Text = "Checking for updates...");
+        }
+
+        var (update, error) = await _appUpdater.CheckAndDownloadAsync();
+
+        await Dispatcher.InvokeAsync(() =>
+        {
+            if (error != null)
+            {
+                AppLogger.Log($"Update check error: {error.Message}");
+                if (showManualResult)
+                {
+                    _trayIcon?.ShowBalloonTip(
+                        7000,
+                        "Spot Lyrics",
+                        "Could not check for updates.",
+                        Forms.ToolTipIcon.Warning);
+                }
+
+                if (_updateMenuItem != null)
+                    _updateMenuItem.Text = $"Check for updates (v{AppUpdater.GetCurrentVersion()})";
+                return;
+            }
+
+            if (update == null)
+            {
+                _availableUpdate = null;
+                if (_updateMenuItem != null)
+                    _updateMenuItem.Text = $"Check for updates (v{AppUpdater.GetCurrentVersion()})";
+
+                if (showManualResult)
+                {
+                    _trayIcon?.ShowBalloonTip(
+                        7000,
+                        "Spot Lyrics",
+                        "You are using the latest version.",
+                        Forms.ToolTipIcon.Info);
+                }
+                return;
+            }
+
+            _availableUpdate = update;
+            if (_updateMenuItem != null)
+                _updateMenuItem.Text = $"Restart and update to v{update.Version}";
+
+            _trayIcon?.ShowBalloonTip(
+                10000,
+                "Spot Lyrics update ready",
+                $"v{update.Version} was downloaded. Click here to restart and install.",
+                Forms.ToolTipIcon.Info);
+            AppLogger.Log($"Update ready: v{update.Version} ({update.TagName})");
+        });
+    }
+
+    private async Task ApplyUpdateAndRestartAsync()
+    {
+        if (_availableUpdate == null)
+            return;
+
+        if (_updateMenuItem != null)
+        {
+            await Dispatcher.InvokeAsync(() =>
+                _updateMenuItem.Text = "Installing update...");
+        }
+
+        try
+        {
+            await _appUpdater.ApplyAndRestartAsync();
+            AppLogger.Log($"Starting updater for {_availableUpdate.TagName}");
+            ExitApplication();
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log($"Update installation failed: {ex}");
+            await Dispatcher.InvokeAsync(() =>
+            {
+                _trayIcon?.ShowBalloonTip(
+                    7000,
+                    "Spot Lyrics",
+                    "The update could not be installed.",
+                    Forms.ToolTipIcon.Error);
+                if (_updateMenuItem != null)
+                    _updateMenuItem.Text = $"Restart and update to v{_availableUpdate?.Version}";
+            });
+        }
     }
 
     void ShowOverlay()

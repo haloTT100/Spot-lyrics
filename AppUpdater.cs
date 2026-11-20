@@ -1,0 +1,308 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
+using System.Net.Http;
+using System.Reflection;
+using System.Text.Json;
+
+namespace lyrics_overlay;
+
+public sealed class AppUpdateInfo
+{
+    public required string Version { get; init; }
+    public required string TagName { get; init; }
+    public required string AssetName { get; init; }
+    public required string DownloadUrl { get; init; }
+    public required Uri ReleaseUrl { get; init; }
+}
+
+public sealed class AppUpdater
+{
+    private const string Repository = "haloTT100/Spot-lyrics";
+    private static readonly HttpClient Http = CreateHttpClient();
+
+    private readonly SemaphoreSlim _operationLock = new(1, 1);
+    private AppUpdateInfo? _availableUpdate;
+    private string? _downloadedArchivePath;
+    private string? _stagedDirectory;
+
+    public AppUpdateInfo? AvailableUpdate => _availableUpdate;
+
+    private static HttpClient CreateHttpClient()
+    {
+        var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        http.DefaultRequestHeaders.TryAddWithoutValidation(
+            "User-Agent",
+            "SpotLyrics-Updater/1.0 (https://github.com/haloTT100/Spot-lyrics)");
+        http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/vnd.github+json");
+        return http;
+    }
+
+    public static string GetCurrentVersion()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        string? informationalVersion = assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion;
+
+        if (!string.IsNullOrWhiteSpace(informationalVersion))
+        {
+            int commitSeparator = informationalVersion.IndexOf('+');
+            string version = commitSeparator >= 0
+                ? informationalVersion[..commitSeparator]
+                : informationalVersion;
+
+            if (version.StartsWith('v'))
+                version = version[1..];
+
+            if (TryParseVersion(version, out _))
+                return version;
+        }
+
+        Version? assemblyVersion = assembly.GetName().Version;
+        return assemblyVersion == null
+            ? "0.0.0"
+            : $"{assemblyVersion.Major}.{assemblyVersion.Minor}.{assemblyVersion.Build}";
+    }
+
+    public async Task<(AppUpdateInfo? Update, Exception? Error)> CheckAndDownloadAsync()
+    {
+        await _operationLock.WaitAsync();
+        try
+        {
+            string currentVersion = GetCurrentVersion();
+            using var response = await Http.GetAsync(
+                $"https://api.github.com/repos/{Repository}/releases/latest");
+
+            if (!response.IsSuccessStatusCode)
+            {
+                return (null, new InvalidOperationException(
+                    $"GitHub latest-release lookup failed with HTTP {(int)response.StatusCode}."));
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            using var document = await JsonDocument.ParseAsync(stream);
+            var root = document.RootElement;
+
+            if (!root.TryGetProperty("tag_name", out var tagElement) ||
+                tagElement.ValueKind != JsonValueKind.String)
+            {
+                return (null, new InvalidOperationException("The GitHub release has no tag_name."));
+            }
+
+            string tagName = tagElement.GetString() ?? "";
+            string version = tagName.TrimStart('v');
+            if (!TryParseVersion(version, out var availableVersion))
+                return (null, new InvalidOperationException($"GitHub tag '{tagName}' is not valid SemVer."));
+
+            if (!TryParseVersion(currentVersion, out var installedVersion) ||
+                availableVersion <= installedVersion)
+            {
+                _availableUpdate = null;
+                return (null, null);
+            }
+
+            if (!root.TryGetProperty("assets", out var assetsElement) ||
+                assetsElement.ValueKind != JsonValueKind.Array)
+            {
+                return (null, new InvalidOperationException("The GitHub release has no assets."));
+            }
+
+            JsonElement? zipAsset = null;
+            foreach (var asset in assetsElement.EnumerateArray())
+            {
+                if (!asset.TryGetProperty("name", out var nameElement) ||
+                    nameElement.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                string name = nameElement.GetString() ?? "";
+                if (name.StartsWith("Spot-lyrics-v", StringComparison.OrdinalIgnoreCase) &&
+                    name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                {
+                    zipAsset = asset;
+                    break;
+                }
+            }
+
+            if (zipAsset is not { } assetElement ||
+                !assetElement.TryGetProperty("browser_download_url", out var urlElement) ||
+                urlElement.ValueKind != JsonValueKind.String)
+            {
+                return (null, new InvalidOperationException("A SpotLyrics ZIP asset was not found."));
+            }
+
+            string downloadUrl = urlElement.GetString() ?? "";
+            string assetName = assetElement.GetProperty("name").GetString() ?? "";
+            string releaseUrlText = root.TryGetProperty("html_url", out var releaseUrlElement)
+                ? releaseUrlElement.GetString() ?? ""
+                : "";
+
+            var update = new AppUpdateInfo
+            {
+                Version = version,
+                TagName = tagName,
+                AssetName = assetName,
+                DownloadUrl = downloadUrl,
+                ReleaseUrl = Uri.TryCreate(releaseUrlText, UriKind.Absolute, out var releaseUrl)
+                    ? releaseUrl
+                    : new Uri($"https://github.com/{Repository}/releases")
+            };
+
+            await DownloadAndStageAsync(update);
+            _availableUpdate = update;
+            return (update, null);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log($"Update check failed: {ex.Message}");
+            return (null, ex);
+        }
+        finally
+        {
+            _operationLock.Release();
+        }
+    }
+
+    public async Task ApplyAndRestartAsync()
+    {
+        if (_availableUpdate == null)
+            throw new InvalidOperationException("No update is available.");
+
+        await _operationLock.WaitAsync();
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_stagedDirectory) ||
+                !Directory.Exists(_stagedDirectory))
+            {
+                await DownloadAndStageAsync(_availableUpdate);
+            }
+
+            int currentProcessId = Process.GetCurrentProcess().Id;
+            string appDirectory = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+            string executablePath = Environment.ProcessPath
+                ?? Path.Combine(appDirectory, "SpotLyrics.exe");
+            string updateScriptPath = Path.Combine(
+                Path.GetTempPath(),
+                $"SpotLyrics-update-{Guid.NewGuid():N}.ps1");
+
+            string escapedAppDirectory = EscapeSingleQuoted(appDirectory);
+            string escapedStagingDirectory = EscapeSingleQuoted(_stagedDirectory!);
+            string escapedExecutablePath = EscapeSingleQuoted(executablePath);
+
+            string script = $$"""
+$ErrorActionPreference = 'Stop'
+$processId = {{currentProcessId}}
+$appDirectory = '{{escapedAppDirectory}}'
+$stagingDirectory = '{{escapedStagingDirectory}}'
+$executablePath = '{{escapedExecutablePath}}'
+
+for ($attempt = 0; $attempt -lt 100; $attempt++) {
+    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    if ($null -eq $process) { break }
+    Start-Sleep -Milliseconds 200
+}
+
+Copy-Item -LiteralPath (Join-Path $stagingDirectory '*') -Destination $appDirectory -Recurse -Force
+Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Split-Path $stagingDirectory -Parent) -Recurse -Force -ErrorAction SilentlyContinue
+Start-Process -FilePath $executablePath
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+""";
+
+            await File.WriteAllTextAsync(updateScriptPath, script);
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{updateScriptPath}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+        }
+        finally
+        {
+            _operationLock.Release();
+        }
+    }
+
+    private async Task DownloadAndStageAsync(AppUpdateInfo update)
+    {
+        string tempRoot = Path.Combine(
+            Path.GetTempPath(),
+            "SpotLyricsUpdater",
+            Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempRoot);
+
+        string archivePath = Path.Combine(tempRoot, update.AssetName);
+        using (var download = await Http.GetAsync(
+                   update.DownloadUrl,
+                   HttpCompletionOption.ResponseHeadersRead))
+        {
+            download.EnsureSuccessStatusCode();
+            await using var source = await download.Content.ReadAsStreamAsync();
+            await using var destination = File.Create(archivePath);
+            await source.CopyToAsync(destination);
+        }
+
+        string stagingDirectory = Path.Combine(tempRoot, "staged");
+        Directory.CreateDirectory(stagingDirectory);
+        ExtractZipSafely(archivePath, stagingDirectory);
+
+        _downloadedArchivePath = archivePath;
+        _stagedDirectory = stagingDirectory;
+        AppLogger.Log($"Downloaded and staged update {update.TagName} at {_stagedDirectory}");
+    }
+
+    private static void ExtractZipSafely(string archivePath, string destinationDirectory)
+    {
+        string destinationRoot = Path.GetFullPath(destinationDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+
+        using var archive = ZipFile.OpenRead(archivePath);
+        foreach (var entry in archive.Entries)
+        {
+            if (string.IsNullOrEmpty(entry.Name))
+            {
+                string directoryPath = Path.GetFullPath(
+                    Path.Combine(destinationRoot, entry.FullName));
+                EnsureInsideDestination(destinationRoot, directoryPath);
+                Directory.CreateDirectory(directoryPath);
+                continue;
+            }
+
+            string targetPath = Path.GetFullPath(
+                Path.Combine(destinationRoot, entry.FullName));
+            EnsureInsideDestination(destinationRoot, targetPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+
+            using var source = entry.Open();
+            using var target = File.Create(targetPath);
+            source.CopyTo(target);
+        }
+    }
+
+    private static void EnsureInsideDestination(string destinationRoot, string targetPath)
+    {
+        if (!targetPath.StartsWith(destinationRoot, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("The update archive contains an invalid path.");
+    }
+
+    private static string EscapeSingleQuoted(string value) =>
+        value.Replace("'", "''");
+
+    private static bool TryParseVersion(string value, out Version version)
+    {
+        if (!Version.TryParse(value, out version!))
+        {
+            version = new Version();
+            return false;
+        }
+
+        return version.Major >= 0 &&
+               version.Minor >= 0 &&
+               version.Build >= 0;
+    }
+}
