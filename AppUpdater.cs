@@ -212,38 +212,56 @@ public sealed class AppUpdater
                 ?? Path.Combine(appDirectory, "SpotLyrics.exe");
             string updateScriptPath = Path.Combine(
                 Path.GetTempPath(),
-                $"SpotLyrics-update-{Guid.NewGuid():N}.ps1");
-
-            string escapedAppDirectory = EscapeSingleQuoted(appDirectory);
-            string escapedStagingDirectory = EscapeSingleQuoted(_stagedDirectory!);
-            string escapedExecutablePath = EscapeSingleQuoted(executablePath);
+                $"SpotLyrics-update-{Guid.NewGuid():N}.cmd");
+            string updateLogPath = Path.Combine(
+                Path.GetTempPath(),
+                $"SpotLyrics-update-{Guid.NewGuid():N}.log");
 
             string script = $$"""
-$ErrorActionPreference = 'Stop'
-$processId = {{currentProcessId}}
-$appDirectory = '{{escapedAppDirectory}}'
-$stagingDirectory = '{{escapedStagingDirectory}}'
-$executablePath = '{{escapedExecutablePath}}'
+@echo off
+setlocal
+set "PID={{currentProcessId}}"
+set "APP_DIR={{appDirectory.Replace("\"", "\"\"")}}"
+set "STAGING_DIR={{_stagedDirectory!.Replace("\"", "\"\"")}}"
+set "EXE_PATH={{executablePath.Replace("\"", "\"\"")}}"
+set "UPDATE_LOG={{updateLogPath.Replace("\"", "\"\"")}}"
 
-for ($attempt = 0; $attempt -lt 100; $attempt++) {
-    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
-    if ($null -eq $process) { break }
-    Start-Sleep -Milliseconds 200
-}
+echo [%date% %time%] Waiting for SpotLyrics PID %PID%>>"%UPDATE_LOG%"
+for /L %%I in (1,1,100) do (
+    tasklist /FI "PID eq %PID%" | findstr /R /C:" %PID% " >nul
+    if errorlevel 1 goto stopped
+    timeout /T 1 /NOBREAK >nul
+)
 
-Copy-Item -LiteralPath (Join-Path $stagingDirectory '*') -Destination $appDirectory -Recurse -Force
-Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath (Split-Path $stagingDirectory -Parent) -Recurse -Force -ErrorAction SilentlyContinue
-Start-Process -FilePath $executablePath
-Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+echo [%date% %time%] Process did not exit in time>>"%UPDATE_LOG%"
+exit /B 1
+
+:stopped
+echo [%date% %time%] Process stopped; copying update>>"%UPDATE_LOG%"
+xcopy "%STAGING_DIR%\*" "%APP_DIR%\" /E /I /Y /H /C >>"%UPDATE_LOG%" 2>&1
+if errorlevel 1 (
+    echo [%date% %time%] Copy failed with errorlevel %errorlevel%>>"%UPDATE_LOG%"
+    exit /B 1
+)
+
+echo [%date% %time%] Copy complete; starting application>>"%UPDATE_LOG%"
+start "" "%EXE_PATH%"
+if errorlevel 1 (
+    echo [%date% %time%] Failed to restart application>>"%UPDATE_LOG%"
+    exit /B 1
+)
+
+echo [%date% %time%] Update completed>>"%UPDATE_LOG%"
+for %%I in ("%STAGING_DIR%\..") do rmdir /S /Q "%%~fI" >nul 2>&1
+del "%~f0" >nul 2>&1
 """;
 
             await File.WriteAllTextAsync(updateScriptPath, script);
 
             Process.Start(new ProcessStartInfo
             {
-                FileName = "powershell.exe",
-                Arguments = $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{updateScriptPath}\"",
+                FileName = "cmd.exe",
+                Arguments = $"/D /C \"\"{updateScriptPath}\"\"",
                 UseShellExecute = false,
                 CreateNoWindow = true
             });
@@ -351,9 +369,6 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
                downloadUri.Host.Equals("objects.githubusercontent.com", StringComparison.OrdinalIgnoreCase) ||
                downloadUri.Host.EndsWith(".release-assets.githubusercontent.com", StringComparison.OrdinalIgnoreCase);
     }
-
-    private static string EscapeSingleQuoted(string value) =>
-        value.Replace("'", "''");
 
     private static bool TryParseVersion(string value, out Version version)
     {
