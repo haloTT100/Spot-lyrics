@@ -988,11 +988,12 @@ public partial class MainWindow : Window
 
                 if (showManualResult)
                 {
-                    _trayIcon?.ShowBalloonTip(
-                        7000,
-                        "Spot Lyrics",
+                    System.Windows.MessageBox.Show(
+                        this,
                         "You are using the latest version.",
-                        Forms.ToolTipIcon.Info);
+                        "Spot Lyrics Update",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
                 }
                 return;
             }
