@@ -299,32 +299,14 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 
     private static void ExtractZipSafely(string archivePath, string destinationDirectory)
     {
-        string destinationRoot = Path.GetFullPath(destinationDirectory)
-            .TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-
         using var archive = ZipFile.OpenRead(archivePath);
         foreach (var entry in archive.Entries)
         {
-            if (entry.FullName.Contains('\\') ||
-                entry.FullName.Contains(':') ||
-                entry.FullName.Contains("..", StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException("The update archive contains an invalid path.");
-            }
-
             if (string.IsNullOrEmpty(entry.Name))
-            {
-                string directoryPath = Path.GetFullPath(
-                    Path.Combine(destinationRoot, entry.FullName));
-                EnsureInsideDestination(destinationRoot, directoryPath);
-                Directory.CreateDirectory(directoryPath);
                 continue;
-            }
 
-            string targetPath = Path.GetFullPath(
-                Path.Combine(destinationRoot, entry.FullName));
-            EnsureInsideDestination(destinationRoot, targetPath);
-            if (!IsAllowedUpdateFile(entry.FullName))
+            string? targetPath = GetAllowedUpdateTarget(destinationDirectory, entry.FullName);
+            if (targetPath == null)
                 throw new InvalidOperationException(
                     $"The update archive contains an unexpected file: {entry.FullName}");
 
@@ -336,10 +318,28 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
         }
     }
 
-    private static void EnsureInsideDestination(string destinationRoot, string targetPath)
+    private static string? GetAllowedUpdateTarget(string destinationDirectory, string entryName)
     {
-        if (!targetPath.StartsWith(destinationRoot, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("The update archive contains an invalid path.");
+        return entryName switch
+        {
+            "SpotLyrics.exe" => Path.Combine(destinationDirectory, "SpotLyrics.exe"),
+            "SpotLyrics.dll" => Path.Combine(destinationDirectory, "SpotLyrics.dll"),
+            "SpotLyrics.runtimeconfig.json" => Path.Combine(destinationDirectory, "SpotLyrics.runtimeconfig.json"),
+            "SpotLyrics.deps.json" => Path.Combine(destinationDirectory, "SpotLyrics.deps.json"),
+            "Kawazu.dll" => Path.Combine(destinationDirectory, "Kawazu.dll"),
+            "LibNMeCab.dll" => Path.Combine(destinationDirectory, "LibNMeCab.dll"),
+            "LibNMeCab.IpaDicBin.dll" => Path.Combine(destinationDirectory, "LibNMeCab.IpaDicBin.dll"),
+            "Microsoft.Windows.SDK.NET.dll" => Path.Combine(destinationDirectory, "Microsoft.Windows.SDK.NET.dll"),
+            "WinRT.Runtime.dll" => Path.Combine(destinationDirectory, "WinRT.Runtime.dll"),
+            "YamlDotNet.dll" => Path.Combine(destinationDirectory, "YamlDotNet.dll"),
+            "IpaDic/AUTHORS" => Path.Combine(destinationDirectory, "IpaDic", "AUTHORS"),
+            "IpaDic/char.bin" => Path.Combine(destinationDirectory, "IpaDic", "char.bin"),
+            "IpaDic/COPYING" => Path.Combine(destinationDirectory, "IpaDic", "COPYING"),
+            "IpaDic/matrix.bin" => Path.Combine(destinationDirectory, "IpaDic", "matrix.bin"),
+            "IpaDic/sys.dic" => Path.Combine(destinationDirectory, "IpaDic", "sys.dic"),
+            "IpaDic/unk.dic" => Path.Combine(destinationDirectory, "IpaDic", "unk.dic"),
+            _ => null
+        };
     }
 
     private static bool IsAllowedGitHubDownloadHost(Uri downloadUri)
@@ -350,30 +350,6 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
         return downloadUri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase) ||
                downloadUri.Host.Equals("objects.githubusercontent.com", StringComparison.OrdinalIgnoreCase) ||
                downloadUri.Host.EndsWith(".release-assets.githubusercontent.com", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsAllowedUpdateFile(string relativePath)
-    {
-        if (relativePath.StartsWith("IpaDic/", StringComparison.OrdinalIgnoreCase) &&
-            !relativePath.EndsWith("/", StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        string fileName = Path.GetFileName(relativePath);
-        if (fileName.Equals("SpotLyrics.exe", StringComparison.OrdinalIgnoreCase) ||
-            fileName.Equals("SpotLyrics.dll", StringComparison.OrdinalIgnoreCase) ||
-            fileName.Equals("SpotLyrics.runtimeconfig.json", StringComparison.OrdinalIgnoreCase) ||
-            fileName.Equals("SpotLyrics.deps.json", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        string extension = Path.GetExtension(fileName);
-        return extension.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
-               extension.Equals(".json", StringComparison.OrdinalIgnoreCase) ||
-               extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) ||
-               extension.Equals(".config", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string EscapeSingleQuoted(string value) =>
