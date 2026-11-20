@@ -121,7 +121,7 @@ public partial class MainWindow : Window
     private readonly AppUpdater _appUpdater = new();
     private Forms.ToolStripMenuItem? _updateMenuItem;
     private AppUpdateInfo? _availableUpdate;
-    private DispatcherTimer? _startupUpdateRetryTimer;
+    private bool _showUpdateNotification = true;
 
     private static Drawing.Icon LoadTrayIcon()
     {
@@ -195,7 +195,7 @@ public partial class MainWindow : Window
                 LoadWindowSettings();
                 MakeClickThrough();
                 SetupTrayIcon();
-                StartAutomaticUpdateCheck();
+                await CheckForStartupUpdateAsync();
 
                 ApplyOverlayStyle();
                 await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
@@ -807,6 +807,19 @@ public partial class MainWindow : Window
             ShowLogWindow();
         });
 
+        var showUpdateNotificationItem = new Forms.ToolStripMenuItem("Show update notification")
+        {
+            CheckOnClick = true,
+            Checked = _showUpdateNotification
+        };
+        showUpdateNotificationItem.CheckedChanged += (_, __) =>
+        {
+            _showUpdateNotification = showUpdateNotificationItem.Checked;
+            AppLogger.Log($"Tray menu: ShowUpdateNotification changed to {_showUpdateNotification}");
+            SaveWindowSettings();
+        };
+        menu.Items.Add(showUpdateNotificationItem);
+
         _updateMenuItem = new Forms.ToolStripMenuItem(
             $"Check for updates (v{AppUpdater.GetCurrentVersion()})",
             null,
@@ -908,48 +921,34 @@ public partial class MainWindow : Window
         AppLogger.Log("SetupTrayIcon end");
     }
 
-    private void StartAutomaticUpdateCheck()
+    private async Task CheckForStartupUpdateAsync()
     {
-        _ = CheckForUpdatesAsync(showManualResult: false);
-
-        _startupUpdateRetryTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromSeconds(15)
-        };
-        int retryCount = 0;
-        _startupUpdateRetryTimer.Tick += (_, __) =>
-        {
-            retryCount++;
-
-            if (_availableUpdate != null)
-            {
-                ShowUpdateNotification();
-                _startupUpdateRetryTimer?.Stop();
-                return;
-            }
-
-            if (retryCount >= 3)
-            {
-                _startupUpdateRetryTimer?.Stop();
-                return;
-            }
-
-            _ = CheckForUpdatesAsync(showManualResult: false);
-        };
-        _startupUpdateRetryTimer.Start();
-    }
-
-    private void ShowUpdateNotification()
-    {
-        if (_availableUpdate == null || _trayIcon == null)
+        if (!_showUpdateNotification)
             return;
 
-        _trayIcon.Visible = true;
-        _trayIcon.ShowBalloonTip(
-            10000,
-            "Spot Lyrics update ready",
-            $"v{_availableUpdate.Version} was downloaded. Click here to restart and install.",
-            Forms.ToolTipIcon.Info);
+        var (update, error) = await _appUpdater.CheckForUpdateAsync();
+        if (error != null)
+        {
+            AppLogger.Log($"Startup update check failed: {error.Message}");
+            return;
+        }
+
+        if (update == null)
+            return;
+
+        _availableUpdate = update;
+        if (_updateMenuItem != null)
+            _updateMenuItem.Text = $"Update to v{update.Version}";
+
+        MessageBoxResult result = System.Windows.MessageBox.Show(
+            this,
+            $"A new version of Spot Lyrics is available: v{update.Version}\n\nUpdate now?",
+            "Spot Lyrics Update",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Information);
+
+        if (result == MessageBoxResult.Yes)
+            await ApplyUpdateAndRestartAsync();
     }
 
     private async Task CheckForUpdatesAsync(bool showManualResult)
@@ -960,7 +959,7 @@ public partial class MainWindow : Window
                 _updateMenuItem.Text = "Checking for updates...");
         }
 
-        var (update, error) = await _appUpdater.CheckAndDownloadAsync();
+        var (update, error) = await _appUpdater.CheckForUpdateAsync();
 
         await Dispatcher.InvokeAsync(() =>
         {
@@ -1000,9 +999,20 @@ public partial class MainWindow : Window
 
             _availableUpdate = update;
             if (_updateMenuItem != null)
-                _updateMenuItem.Text = $"Restart and update to v{update.Version}";
+                _updateMenuItem.Text = $"Update to v{update.Version}";
 
-            ShowUpdateNotification();
+            if (showManualResult)
+            {
+                MessageBoxResult result = System.Windows.MessageBox.Show(
+                    this,
+                    $"A new version of Spot Lyrics is available: v{update.Version}\n\nUpdate now?",
+                    "Spot Lyrics Update",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Information);
+
+                if (result == MessageBoxResult.Yes)
+                    _ = ApplyUpdateAndRestartAsync();
+            }
             AppLogger.Log($"Update ready: v{update.Version} ({update.TagName})");
         });
     }
@@ -1152,8 +1162,9 @@ public partial class MainWindow : Window
             _textOnlyMode = settings.TextOnlyMode;
             _currentLineOnlyMode = settings.CurrentLineOnlyMode;
             showRomanizedText = settings.ShowRomanizedText;
+            _showUpdateNotification = settings.ShowUpdateNotification;
 
-            AppLogger.Log($"Loaded window settings Left={Left} Top={Top} Width={Width} Height={Height} TextOnlyMode={_textOnlyMode} CurrentLineOnlyMode={_currentLineOnlyMode} ShowRomanizedText={showRomanizedText}");
+            AppLogger.Log($"Loaded window settings Left={Left} Top={Top} Width={Width} Height={Height} TextOnlyMode={_textOnlyMode} CurrentLineOnlyMode={_currentLineOnlyMode} ShowRomanizedText={showRomanizedText} ShowUpdateNotification={_showUpdateNotification}");
         }
         finally
         {
@@ -1213,7 +1224,8 @@ public partial class MainWindow : Window
             Height = height,
             TextOnlyMode = _textOnlyMode,
             CurrentLineOnlyMode = _currentLineOnlyMode,
-            ShowRomanizedText = showRomanizedText
+            ShowRomanizedText = showRomanizedText,
+            ShowUpdateNotification = _showUpdateNotification
         };
 
         return true;
@@ -1352,6 +1364,7 @@ public class WindowSettings
     public bool TextOnlyMode { get; set; } = true;
     public bool CurrentLineOnlyMode { get; set; }
     public bool ShowRomanizedText { get; set; } = true;
+    public bool ShowUpdateNotification { get; set; } = true;
 }
 
 public class DisplayLyricLine : INotifyPropertyChanged
