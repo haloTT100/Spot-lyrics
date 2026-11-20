@@ -68,7 +68,7 @@ public sealed class AppUpdater
             : $"{assemblyVersion.Major}.{assemblyVersion.Minor}.{assemblyVersion.Build}";
     }
 
-    public async Task<(AppUpdateInfo? Update, Exception? Error)> CheckAndDownloadAsync()
+    public async Task<(AppUpdateInfo? Update, Exception? Error)> CheckForUpdateAsync()
     {
         await _operationLock.WaitAsync();
         try
@@ -178,7 +178,6 @@ public sealed class AppUpdater
                     : new Uri($"https://github.com/{Repository}/releases")
             };
 
-            await DownloadAndStageAsync(update);
             _availableUpdate = update;
             return (update, null);
         }
