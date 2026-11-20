@@ -121,6 +121,7 @@ public partial class MainWindow : Window
     private readonly AppUpdater _appUpdater = new();
     private Forms.ToolStripMenuItem? _updateMenuItem;
     private AppUpdateInfo? _availableUpdate;
+    private DispatcherTimer? _startupUpdateRetryTimer;
 
     private static Drawing.Icon LoadTrayIcon()
     {
@@ -194,7 +195,7 @@ public partial class MainWindow : Window
                 LoadWindowSettings();
                 MakeClickThrough();
                 SetupTrayIcon();
-                _ = CheckForUpdatesAsync(showManualResult: false);
+                StartAutomaticUpdateCheck();
 
                 ApplyOverlayStyle();
                 await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
@@ -907,6 +908,50 @@ public partial class MainWindow : Window
         AppLogger.Log("SetupTrayIcon end");
     }
 
+    private void StartAutomaticUpdateCheck()
+    {
+        _ = CheckForUpdatesAsync(showManualResult: false);
+
+        _startupUpdateRetryTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(15)
+        };
+        int retryCount = 0;
+        _startupUpdateRetryTimer.Tick += (_, __) =>
+        {
+            retryCount++;
+
+            if (_availableUpdate != null)
+            {
+                ShowUpdateNotification();
+                _startupUpdateRetryTimer?.Stop();
+                return;
+            }
+
+            if (retryCount >= 3)
+            {
+                _startupUpdateRetryTimer?.Stop();
+                return;
+            }
+
+            _ = CheckForUpdatesAsync(showManualResult: false);
+        };
+        _startupUpdateRetryTimer.Start();
+    }
+
+    private void ShowUpdateNotification()
+    {
+        if (_availableUpdate == null || _trayIcon == null)
+            return;
+
+        _trayIcon.Visible = true;
+        _trayIcon.ShowBalloonTip(
+            10000,
+            "Spot Lyrics update ready",
+            $"v{_availableUpdate.Version} was downloaded. Click here to restart and install.",
+            Forms.ToolTipIcon.Info);
+    }
+
     private async Task CheckForUpdatesAsync(bool showManualResult)
     {
         if (_updateMenuItem != null)
@@ -957,11 +1002,7 @@ public partial class MainWindow : Window
             if (_updateMenuItem != null)
                 _updateMenuItem.Text = $"Restart and update to v{update.Version}";
 
-            _trayIcon?.ShowBalloonTip(
-                10000,
-                "Spot Lyrics update ready",
-                $"v{update.Version} was downloaded. Click here to restart and install.",
-                Forms.ToolTipIcon.Info);
+            ShowUpdateNotification();
             AppLogger.Log($"Update ready: v{update.Version} ({update.TagName})");
         });
     }
