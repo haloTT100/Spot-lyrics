@@ -1,16 +1,18 @@
-name: Build
+name: Build and Release
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    types: [opened, synchronize, reopened, closed]
+    branches: ["main"]
 
 jobs:
   build:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: windows-latest
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout
@@ -19,26 +21,116 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: "10.0.x"
 
       - name: Restore dependencies
         run: dotnet restore --runtime win-x64
 
       - name: Build
-        run: dotnet build --no-restore --configuration Release
+        run: dotnet build --no-restore --configuration Release --runtime win-x64
+
+  release:
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Fetch all tags
+        run: git fetch --force --tags
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Determine next version
+        id: version
+        shell: pwsh
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          $latestTag = git tag --list "v*" --sort=-version:refname |
+            Select-Object -First 1
+
+          if (-not $latestTag) {
+            $major = 1
+            $minor = 0
+            $patch = 0
+          } else {
+            if ($latestTag -notmatch '^v(\d+)\.(\d+)\.(\d+)$') {
+              throw "Latest tag '$latestTag' is not valid semver"
+            }
+
+            $major = [int]$matches[1]
+            $minor = [int]$matches[2]
+            $patch = [int]$matches[3]
+
+            $labels = $env:PR_LABELS -split ","
+
+            if ($labels -contains "release:major") {
+              $major++
+              $minor = 0
+              $patch = 0
+            } elseif ($labels -contains "release:minor") {
+              $minor++
+              $patch = 0
+            } else {
+              $patch++
+            }
+          }
+
+          $tag = "v$major.$minor.$patch"
+          $version = "$major.$minor.$patch"
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "assembly_version=$major.0.0.0" >> $env:GITHUB_OUTPUT
+
+      - name: Restore dependencies
+        run: dotnet restore --runtime win-x64
+
+      - name: Build
+        run: |
+          dotnet build "lyrics overlay.csproj" --no-restore --configuration Release --runtime win-x64 `
+            -p:Version=${{ steps.version.outputs.version }} `
+            -p:AssemblyVersion=${{ steps.version.outputs.assembly_version }} `
+            -p:FileVersion=${{ steps.version.outputs.version }}.0 `
+            -p:InformationalVersion=${{ steps.version.outputs.tag }}+${{ github.sha }}
 
       - name: Publish
-        run: dotnet publish "lyrics overlay.csproj" --no-restore --configuration Release --runtime win-x64 --self-contained false --output ./publish
+        run: |
+          dotnet publish "lyrics overlay.csproj" --no-restore --configuration Release --runtime win-x64 --self-contained false --output ./publish `
+            -p:Version=${{ steps.version.outputs.version }} `
+            -p:AssemblyVersion=${{ steps.version.outputs.assembly_version }} `
+            -p:FileVersion=${{ steps.version.outputs.version }}.0 `
+            -p:InformationalVersion=${{ steps.version.outputs.tag }}+${{ github.sha }}
 
-      - name: Zip artifact
-        run: Compress-Archive -Path ./publish/* -DestinationPath ./Spot-lyrics.zip
+      - name: Zip downloadable release
+        run: Compress-Archive -Path ./publish/* -DestinationPath ./Spot-lyrics-${{ steps.version.outputs.tag }}.zip -Force
 
-      - name: Create or update GitHub Release
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      - name: Create version tag
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.tag }}
+          git push origin ${{ steps.version.outputs.tag }}
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: Latest Build
-          body: "Automatically built from the latest commit on main."
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          draft: false
           prerelease: false
-          files: ./Spot-lyrics.zip
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: ./Spot-lyrics-${{ steps.version.outputs.tag }}.zip
