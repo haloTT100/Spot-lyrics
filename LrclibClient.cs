@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using YamlDotNet.Serialization;
@@ -56,8 +57,8 @@ public sealed class LrclibClient
             using var response = await Http.GetAsync(url);
             if (response.StatusCode == HttpStatusCode.NotFound)
             {
-                AppLogger.Log("LRCLIB did not find a matching track");
-                return null;
+                AppLogger.Log("LRCLIB exact lookup did not find a match; trying search");
+                return await SearchLyricsAsync(artist, title, album, durationMs, transformLyricTextAsync);
             }
 
             if (!response.IsSuccessStatusCode)
@@ -78,43 +79,209 @@ public sealed class LrclibClient
             using var document = await JsonDocument.ParseAsync(responseStream);
             if (document.RootElement.ValueKind != JsonValueKind.Object)
                 return null;
-
-            var result = new LrclibLyricsResult
-            {
-                IsInstrumental = ReadBoolean(document.RootElement, "instrumental"),
-                HasWordSync = ReadBoolean(document.RootElement, "hasWordSync")
-            };
-
-            if (document.RootElement.TryGetProperty("lyricsfile", out var lyricsFileElement) &&
-                lyricsFileElement.ValueKind == JsonValueKind.String)
-            {
-                string lyricsFile = lyricsFileElement.GetString() ?? "";
-                if (lyricsFile.Length > MaxLyricsFileCharacters)
-                {
-                    AppLogger.Log($"LRCLIB lyricsfile exceeded size limit ({lyricsFile.Length} characters)");
-                }
-                else if (!string.IsNullOrWhiteSpace(lyricsFile))
-                {
-                    await ReadLyricsFileAsync(lyricsFile, result, transformLyricTextAsync);
-                }
-            }
-
-            if (document.RootElement.TryGetProperty("syncedLyrics", out var syncedLyricsElement) &&
-                syncedLyricsElement.ValueKind == JsonValueKind.String)
-            {
-                string syncedLyrics = syncedLyricsElement.GetString() ?? "";
-                if (result.SyncedLyrics.Count == 0)
-                    result.SyncedLyrics = await ParseLrcAsync(syncedLyrics, transformLyricTextAsync);
-            }
-
-            AppLogger.Log($"LRCLIB result | wordSync={result.WordSyncedKaraokeLines.Count} lines | synced={result.SyncedLyrics.Count} lines | instrumental={result.IsInstrumental}");
-            return result;
+            return await ParseLyricsRecordAsync(document.RootElement, transformLyricTextAsync);
         }
         catch (Exception ex)
         {
             AppLogger.Log($"LRCLIB lookup failed: {ex.Message}");
             return null;
         }
+    }
+
+    private async Task<LrclibLyricsResult?> SearchLyricsAsync(
+        string artist,
+        string title,
+        string album,
+        int durationMs,
+        Func<string, Task<(string original, string display)>> transformLyricTextAsync)
+    {
+        var structuredParameters = new Dictionary<string, string>
+        {
+            ["track_name"] = title,
+            ["artist_name"] = artist
+        };
+        string structuredUrl = $"{BaseUrl}/api/search?{BuildQuery(structuredParameters)}";
+
+        using var structuredResponse = await Http.GetAsync(structuredUrl);
+        JsonElement[] candidates;
+
+        if (structuredResponse.IsSuccessStatusCode)
+        {
+            await using var stream = await structuredResponse.Content.ReadAsStreamAsync();
+            using var document = await JsonDocument.ParseAsync(stream);
+            if (document.RootElement.ValueKind == JsonValueKind.Array)
+                candidates = document.RootElement.EnumerateArray().Select(item => item.Clone()).ToArray();
+            else
+                candidates = Array.Empty<JsonElement>();
+        }
+        else
+        {
+            candidates = Array.Empty<JsonElement>();
+        }
+
+        if (candidates.Length == 0)
+        {
+            var keywordParameters = new Dictionary<string, string>
+            {
+                ["q"] = $"{title} {artist}".Trim()
+            };
+            using var keywordResponse = await Http.GetAsync(
+                $"{BaseUrl}/api/search?{BuildQuery(keywordParameters)}");
+            if (!keywordResponse.IsSuccessStatusCode)
+                return null;
+
+            await using var stream = await keywordResponse.Content.ReadAsStreamAsync();
+            using var document = await JsonDocument.ParseAsync(stream);
+            if (document.RootElement.ValueKind == JsonValueKind.Array)
+                candidates = document.RootElement.EnumerateArray().Select(item => item.Clone()).ToArray();
+        }
+
+        var best = candidates
+            .Select(candidate => new
+            {
+                Candidate = candidate,
+                Score = ScoreSearchCandidate(candidate, artist, title, album, durationMs)
+            })
+            .Where(match => match.Score > 0)
+            .OrderByDescending(match => match.Score)
+            .FirstOrDefault();
+
+        if (best == null)
+        {
+            AppLogger.Log("LRCLIB search fallback did not find a usable match");
+            return null;
+        }
+
+        JsonElement candidateRecord = best.Candidate;
+        AppLogger.Log($"LRCLIB search fallback selected score={best.Score}");
+
+        if (candidateRecord.TryGetProperty("id", out var idElement) &&
+            idElement.ValueKind == JsonValueKind.Number &&
+            idElement.TryGetInt64(out long id))
+        {
+            using var detailResponse = await Http.GetAsync($"{BaseUrl}/api/get/{id}");
+            if (detailResponse.IsSuccessStatusCode)
+            {
+                await using var detailStream = await detailResponse.Content.ReadAsStreamAsync();
+                using var detailDocument = await JsonDocument.ParseAsync(detailStream);
+                if (detailDocument.RootElement.ValueKind == JsonValueKind.Object)
+                    return await ParseLyricsRecordAsync(detailDocument.RootElement, transformLyricTextAsync);
+            }
+        }
+
+        return await ParseLyricsRecordAsync(candidateRecord, transformLyricTextAsync);
+    }
+
+    private static int ScoreSearchCandidate(
+        JsonElement candidate,
+        string artist,
+        string title,
+        string album,
+        int durationMs)
+    {
+        string candidateTitle = ReadString(candidate, "trackName");
+        string candidateArtist = ReadString(candidate, "artistName");
+        string candidateAlbum = ReadString(candidate, "albumName");
+
+        string normalizedTitle = NormalizeSearchText(title);
+        string normalizedCandidateTitle = NormalizeSearchText(candidateTitle);
+        if (normalizedCandidateTitle.Length == 0 ||
+            !normalizedCandidateTitle.Equals(normalizedTitle, StringComparison.OrdinalIgnoreCase))
+        {
+            if (!normalizedCandidateTitle.Contains(normalizedTitle, StringComparison.OrdinalIgnoreCase) &&
+                !normalizedTitle.Contains(normalizedCandidateTitle, StringComparison.OrdinalIgnoreCase))
+                return 0;
+        }
+
+        int score = normalizedCandidateTitle.Equals(normalizedTitle, StringComparison.OrdinalIgnoreCase) ? 100 : 60;
+
+        string normalizedArtist = NormalizeSearchText(artist);
+        string normalizedCandidateArtist = NormalizeSearchText(candidateArtist);
+        if (normalizedCandidateArtist.Equals(normalizedArtist, StringComparison.OrdinalIgnoreCase))
+            score += 100;
+        else if (normalizedCandidateArtist.Contains(normalizedArtist, StringComparison.OrdinalIgnoreCase) ||
+                 normalizedArtist.Contains(normalizedCandidateArtist, StringComparison.OrdinalIgnoreCase))
+            score += 70;
+
+        if (!string.IsNullOrWhiteSpace(album) &&
+            NormalizeSearchText(candidateAlbum).Equals(NormalizeSearchText(album), StringComparison.OrdinalIgnoreCase))
+        {
+            score += 30;
+        }
+
+        if (durationMs >= 1000 &&
+            candidate.TryGetProperty("duration", out var durationElement) &&
+            durationElement.ValueKind == JsonValueKind.Number &&
+            durationElement.TryGetDouble(out double candidateDurationSeconds))
+        {
+            int differenceSeconds = (int)Math.Abs((durationMs / 1000.0) - candidateDurationSeconds);
+            if (differenceSeconds <= 2)
+                score += 20;
+            else if (differenceSeconds <= 5)
+                score += 10;
+            else
+                score -= 30;
+        }
+
+        return score;
+    }
+
+    private static string NormalizeSearchText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return "";
+
+        var result = new StringBuilder();
+        foreach (char character in text.Normalize(NormalizationForm.FormKC))
+        {
+            if (char.IsLetterOrDigit(character))
+                result.Append(char.ToLowerInvariant(character));
+            else if (result.Length > 0 && result[^1] != ' ')
+                result.Append(' ');
+        }
+        return result.ToString().Trim();
+    }
+
+    private static string ReadString(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var value) &&
+        value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? ""
+            : "";
+
+    private async Task<LrclibLyricsResult> ParseLyricsRecordAsync(
+        JsonElement record,
+        Func<string, Task<(string original, string display)>> transformLyricTextAsync)
+    {
+        var result = new LrclibLyricsResult
+        {
+            IsInstrumental = ReadBoolean(record, "instrumental"),
+            HasWordSync = ReadBoolean(record, "hasWordSync")
+        };
+
+        if (record.TryGetProperty("lyricsfile", out var lyricsFileElement) &&
+            lyricsFileElement.ValueKind == JsonValueKind.String)
+        {
+            string lyricsFile = lyricsFileElement.GetString() ?? "";
+            if (lyricsFile.Length > MaxLyricsFileCharacters)
+            {
+                AppLogger.Log($"LRCLIB lyricsfile exceeded size limit ({lyricsFile.Length} characters)");
+            }
+            else if (!string.IsNullOrWhiteSpace(lyricsFile))
+            {
+                await ReadLyricsFileAsync(lyricsFile, result, transformLyricTextAsync);
+            }
+        }
+
+        if (record.TryGetProperty("syncedLyrics", out var syncedLyricsElement) &&
+            syncedLyricsElement.ValueKind == JsonValueKind.String)
+        {
+            string syncedLyrics = syncedLyricsElement.GetString() ?? "";
+            if (result.SyncedLyrics.Count == 0)
+                result.SyncedLyrics = await ParseLrcAsync(syncedLyrics, transformLyricTextAsync);
+        }
+
+        AppLogger.Log($"LRCLIB result | wordSync={result.WordSyncedKaraokeLines.Count} lines | synced={result.SyncedLyrics.Count} lines | instrumental={result.IsInstrumental}");
+        return result;
     }
 
     private static async Task ReadLyricsFileAsync(
